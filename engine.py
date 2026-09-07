@@ -44,7 +44,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.6'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.6.3'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -666,6 +666,9 @@ def demo_open(d):
     if MODE != 'demo': raise ValueError('Demo mode is not enabled')
     side = str(d['side']).upper(); symbol = str(d['symbol']).upper(); entry = float(d['entry']); sl = float(d['stop_loss']); tp = float(d['take_profit'])
     if side not in ('LONG','SHORT'): raise ValueError('side must be LONG or SHORT')
+    if entry <= 0 or sl <= 0 or tp <= 0: raise ValueError('entry, stop_loss and take_profit must be positive')
+    if side == 'LONG' and not (sl < entry < tp): raise ValueError('LONG requires stop_loss < entry < take_profit')
+    if side == 'SHORT' and not (tp < entry < sl): raise ValueError('SHORT requires take_profit < entry < stop_loss')
     positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
     if len(positions) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} demo positions')
     if any(x.get('symbol') == symbol for x in positions): raise ValueError('Demo position for this symbol already open')

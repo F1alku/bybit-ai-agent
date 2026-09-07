@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 import asyncio
 import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 from contextlib import asynccontextmanager
@@ -14,6 +16,9 @@ AUTO_INTERVAL_SEC = 180
 SCAN_CANDIDATES = 24
 auto_lock = threading.RLock()
 scan_lock = threading.Lock()
+scan_jobs = {}
+scan_jobs_lock = threading.Lock()
+scan_executor = ThreadPoolExecutor(max_workers=1)
 auto_state = {'enabled': os.getenv('AUTO_ENABLED','false' if MODE=='demo' else 'true').lower() == 'true', 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0}
 
 @asynccontextmanager
@@ -28,7 +33,7 @@ async def lifespan(_app):
         except asyncio.CancelledError:
             pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.6.0', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.6.3', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 def _auto_iteration():
@@ -146,7 +151,7 @@ class PaperOpenRequest(BaseModel):
 def index(): return FileResponse('static/index.html')
 
 @app.get('/api/health')
-def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.6.0', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
+def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.6.3', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
 
 @app.get('/api/auto')
 def auto_status():
@@ -169,16 +174,48 @@ def markets():
     try: return {'ok': True, 'markets': market_snapshot(20)}
     except Exception as e: raise HTTPException(status_code=502, detail=str(e))
 
+def _run_scan_job(job_id, interval, limit_symbols):
+    try:
+        result = scan_market(interval, limit_symbols)
+        with scan_jobs_lock:
+            scan_jobs[job_id] = {'status': 'done', 'result': result}
+    except Exception as e:
+        with scan_jobs_lock:
+            scan_jobs[job_id] = {'status': 'error', 'error': str(e)}
+    finally:
+        scan_lock.release()
+
 @app.post('/api/scan')
 def scan(req: ScanRequest):
     if not scan_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail='Скан уже выполняется. Подожди завершения текущего цикла.')
+    job_id = uuid.uuid4().hex[:12]
+    with scan_jobs_lock:
+        scan_jobs[job_id] = {'status': 'running', 'interval': req.interval, 'limit_symbols': req.limit_symbols}
+        # Keep only the newest 20 job records so a long-lived Render instance cannot grow memory forever.
+        if len(scan_jobs) > 20:
+            for old_id in list(scan_jobs)[:-20]:
+                scan_jobs.pop(old_id, None)
     try:
-        return scan_market(req.interval, req.limit_symbols)
+        scan_executor.submit(_run_scan_job, job_id, req.interval, req.limit_symbols)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    finally:
         scan_lock.release()
+        with scan_jobs_lock:
+            scan_jobs.pop(job_id, None)
+        raise HTTPException(status_code=503, detail=f'Не удалось запустить скан: {e}')
+    return {'ok': True, 'job_id': job_id, 'status': 'running'}
+
+@app.get('/api/scan/{job_id}')
+def scan_status(job_id: str):
+    with scan_jobs_lock:
+        job = scan_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='Результат скана не найден.')
+    if job['status'] == 'error':
+        raise HTTPException(status_code=502, detail=job.get('error', 'scan failed'))
+    if job['status'] == 'running':
+        return {'ok': True, 'job_id': job_id, 'status': 'running'}
+    return {'ok': True, 'job_id': job_id, 'status': 'done', **job['result']}
 
 @app.get('/api/paper')
 def paper():
