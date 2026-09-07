@@ -54,3 +54,11 @@ def test_budget_and_adaptive_margin(monkeypatch):
     assert s['open'][0]['margin_required'] <= 2.0 * 0.95 + 1e-9
     assert s['available_margin_budget'] < 2.0
     engine.paper_reset()
+
+def test_demo_open_rejects_bad_geometry(monkeypatch):
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    try:
+        engine.demo_open({'symbol':'BTCUSDT','side':'LONG','entry':100,'stop_loss':101,'take_profit':102,'risk_pct':2})
+        assert False
+    except ValueError as e:
+        assert 'LONG requires' in str(e)
