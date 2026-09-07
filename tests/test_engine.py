@@ -46,3 +46,11 @@ def test_daily_risk_lock():
     try: engine.paper_open({'symbol':'BTCUSDT','side':'LONG','entry':100,'stop_loss':99,'take_profit':102,'risk_pct':0.5}); assert False
     except ValueError as e: assert 'daily loss limit' in str(e)
     engine.paper_reset()
+
+def test_budget_and_adaptive_margin(monkeypatch):
+    monkeypatch.setattr(engine, 'instruments', lambda: [{'symbol':'BTCUSDT','lotSizeFilter':{'qtyStep':'0.001','minOrderQty':'0.001','maxOrderQty':'100'}}])
+    engine.paper_reset(); engine.set_paper_budget(2.0)
+    s=engine.paper_open({'symbol':'BTCUSDT','side':'LONG','entry':100,'stop_loss':99,'take_profit':102,'risk_pct':2.0})
+    assert s['open'][0]['margin_required'] <= 2.0 * 0.95 + 1e-9
+    assert s['available_margin_budget'] < 2.0
+    engine.paper_reset()
