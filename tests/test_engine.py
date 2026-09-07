@@ -62,3 +62,48 @@ def test_demo_open_rejects_bad_geometry(monkeypatch):
         assert False
     except ValueError as e:
         assert 'LONG requires' in str(e)
+
+def test_demo_state_survives_closed_pnl_failure(monkeypatch):
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'DEMO_API_KEY', 'k')
+    monkeypatch.setattr(engine, 'DEMO_API_SECRET', 's')
+    monkeypatch.setattr(engine, '_demo_wallet', lambda: {'list':[{'totalEquity':'1000','totalAvailableBalance':'900','totalPerpUPL':'0','coin':[{'coin':'USDT','walletBalance':'1000'}]}]})
+    monkeypatch.setattr(engine, '_demo_positions', lambda: [])
+    monkeypatch.setattr(engine, '_demo_closed_pnl', lambda limit=100: (_ for _ in ()).throw(RuntimeError('temporary closed pnl failure')))
+    state = engine.demo_state()
+    assert state['configured'] is True and state['degraded'] is True
+    assert state['equity'] == 1000.0 and state['positions'] == []
+    assert state['warnings']
+
+
+def test_private_get_retries_transient_http(monkeypatch):
+    class Resp:
+        def __init__(self, status, payload): self.status_code=status; self._payload=payload
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                import httpx
+                req=httpx.Request('GET','https://example.test')
+                raise httpx.HTTPStatusError('x', request=req, response=httpx.Response(self.status_code, request=req))
+        def json(self): return self._payload
+    calls=[]
+    def fake_get(*a, **k):
+        calls.append(1)
+        return Resp(503,{}) if len(calls)==1 else Resp(200,{'retCode':0,'result':{'ok':1}})
+    monkeypatch.setattr(engine._http, 'get', fake_get)
+    monkeypatch.setattr(engine, 'MODE', 'demo'); monkeypatch.setattr(engine, 'DEMO_API_KEY', 'k'); monkeypatch.setattr(engine, 'DEMO_API_SECRET', 's')
+    out=engine.bybit_private_get('/v5/account/info', {}, retries=1)
+    assert out == {'ok':1} and len(calls)==2
+
+
+def test_demo_state_uses_last_good_state_on_wallet_failure(monkeypatch):
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'DEMO_API_KEY', 'k')
+    monkeypatch.setattr(engine, 'DEMO_API_SECRET', 's')
+    good_wallet = {'list':[{'totalEquity':'1000','totalAvailableBalance':'900','totalPerpUPL':'0','coin':[{'coin':'USDT','walletBalance':'1000'}]}]}
+    monkeypatch.setattr(engine, '_demo_wallet', lambda: good_wallet)
+    monkeypatch.setattr(engine, '_demo_positions', lambda: [])
+    monkeypatch.setattr(engine, '_demo_closed_pnl', lambda limit=100: [])
+    first = engine.demo_state()
+    monkeypatch.setattr(engine, '_demo_wallet', lambda: (_ for _ in ()).throw(RuntimeError('wallet timeout')))
+    second = engine.demo_state()
+    assert second['stale'] is True and second['equity'] == first['equity'] and second['usdt_wallet_balance'] == first['usdt_wallet_balance']
