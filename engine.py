@@ -12,7 +12,16 @@ BASE = 'https://api-testnet.bybit.com'
 TIMEOUT = 15.0
 CACHE_TTL = 8.0
 MAX_POSITIONS = 2
-RISK_PCT_DEFAULT = 0.5
+RISK_PCT_DEFAULT = 2.0
+LEVERAGE = 10.0
+START_BALANCE = 10.0
+
+# Scan budget: broad market discovery is one ticker request; expensive candle/microstructure
+# calls are reserved for a small ranked subset.
+TECH_CANDIDATES = 24
+DEEP_CANDIDATES = 8
+MICRO_CANDIDATES = 4
+INSTRUMENT_CACHE_TTL = 600.0
 DAILY_LOSS_LIMIT_PCT = 2.0
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_COOLDOWN_SEC = 30 * 60
@@ -23,15 +32,15 @@ PAPER_SLIPPAGE_RATE = 0.0002
 _lock = threading.RLock()
 _cache = {}
 _state = {
-    'balance': 1000.0,
-    'initial_balance': 1000.0,
+    'balance': START_BALANCE,
+    'initial_balance': START_BALANCE,
     'trades': [],
     'open': [],
     'day': datetime.now(timezone.utc).date().isoformat(),
-    'day_start_balance': 1000.0,
+    'day_start_balance': START_BALANCE,
     'loss_streak': 0,
     'last_loss_at': 0,
-    'peak_equity': 1000.0,
+    'peak_equity': START_BALANCE,
 }
 
 
@@ -73,9 +82,13 @@ def tickers():
 
 
 def instruments():
+    key = ('__instruments__',)
+    item = _cache.get(key)
+    if item and time.time() - item[0] < INSTRUMENT_CACHE_TTL:
+        return item[1]
     result = []
     cursor = None
-    for _ in range(5):
+    for _ in range(10):
         p = {'category': 'linear', 'status': 'Trading', 'limit': 1000}
         if cursor:
             p['cursor'] = cursor
@@ -84,14 +97,18 @@ def instruments():
         cursor = j.get('nextPageCursor')
         if not cursor:
             break
-    return [x for x in result if x.get('contractType') == 'LinearPerpetual' and x.get('quoteCoin') == 'USDT']
+    out = [x for x in result if x.get('contractType') == 'LinearPerpetual'
+           and x.get('quoteCoin') == 'USDT' and x.get('settleCoin') == 'USDT']
+    _cache[key] = (time.time(), out)
+    return out
 
 
 def market_snapshot(limit=20):
+    allowed = {x.get('symbol') for x in instruments() if x.get('symbol')}
     rows = []
     for x in tickers():
         symbol = x.get('symbol', '')
-        if not symbol.endswith('USDT'):
+        if symbol not in allowed:
             continue
         try:
             bid = float(x.get('bid1Price') or 0)
@@ -99,8 +116,7 @@ def market_snapshot(limit=20):
             last = float(x.get('lastPrice') or 0)
             spread_pct = ((ask - bid) / last * 100) if last > 0 and ask >= bid > 0 else None
             rows.append({
-                'symbol': symbol,
-                'lastPrice': last,
+                'symbol': symbol, 'lastPrice': last,
                 'turnover24h': float(x.get('turnover24h') or 0),
                 'price24hPcnt': float(x.get('price24hPcnt') or 0) * 100,
                 'highPrice24h': float(x.get('highPrice24h') or 0),
@@ -113,8 +129,8 @@ def market_snapshot(limit=20):
         except (TypeError, ValueError):
             continue
     rows.sort(key=lambda x: x['turnover24h'], reverse=True)
-    return rows[:max(1, min(int(limit), 50))]
-
+    cap = max(1, min(int(limit), 100))
+    return rows[:cap]
 
 def klines(symbol, interval, limit=220):
     rows = bybit_get('/v5/market/kline', {
@@ -370,45 +386,119 @@ def _ticker_map():
     return {x.get('symbol'): x for x in tickers() if x.get('symbol')}
 
 
-def scan_market(interval='15', limit_symbols=8):
-    if interval not in {'5', '15', '60'}: raise ValueError('interval must be 5, 15 or 60')
-    limit_symbols = max(3, min(int(limit_symbols), 12)); tm = _ticker_map()
-    turnover = {s: float(x.get('turnover24h') or 0) for s, x in tm.items()}
-    symbols = sorted([s for s in turnover if s.endswith('USDT')], key=lambda s: turnover[s], reverse=True)[:limit_symbols]
-    if 'BTCUSDT' not in symbols and 'BTCUSDT' in tm: symbols = symbols[:-1] + ['BTCUSDT']
-    preliminary, failures = [], []
-    with ThreadPoolExecutor(max_workers=min(4, len(symbols) or 1)) as ex:
-        futures = {ex.submit(_scan_one, s, interval, float(tm[s].get('lastPrice') or 0), {}, None): s for s in symbols}
+def _fast_market_universe():
+    allowed = {x.get('symbol') for x in instruments() if x.get('symbol')}
+    tm = _ticker_map()
+    rows = []
+    for symbol, x in tm.items():
+        if symbol not in allowed:
+            continue
+        try:
+            turnover = float(x.get('turnover24h') or 0)
+            last = float(x.get('lastPrice') or 0)
+            bid = float(x.get('bid1Price') or 0); ask = float(x.get('ask1Price') or 0)
+            spread = ((ask-bid)/last*100) if last > 0 and ask >= bid > 0 else 999.0
+            chg = abs(float(x.get('price24hPcnt') or 0))*100
+            # Broad discovery: exclude dead/obviously broken markets, but don't hard-cap by symbol.
+            if last <= 0 or turnover <= 0 or spread >= 1.0:
+                continue
+            rows.append({'symbol': symbol, 'turnover24h': turnover, 'lastPrice': last,
+                         'spreadPct': spread, 'absChange24h': chg,
+                         'price24hPcnt': float(x.get('price24hPcnt') or 0)*100})
+        except (TypeError, ValueError):
+            continue
+    rows.sort(key=lambda x: (x['turnover24h'], -x['spreadPct']), reverse=True)
+    return rows, tm
+
+
+def _technical_one(symbol, interval, tm):
+    # Cheap technical pass: 4H + 1H + setup. 5M and microstructure wait for the shortlist.
+    frames = {k: klines(symbol, k, 180) for k in ['15', '60', '240']}
+    b4, b1 = bias(frames['240']), bias(frames['60'])
+    f15 = frame_features(frames['15']); z = f15.iloc[-1]
+    bull_sweep, bear_sweep = sweep(frames['15'])
+    bull_break, bear_break = structure_confirmation(frames['15'])
+    hi, lo = frames['15'].high.tail(50).max(), frames['15'].low.tail(50).min()
+    rng = max(float(hi-lo), 1e-12); pos = (float(z.close)-float(lo))/rng
+    long_hint = (20 if b4=='LONG' else 0) + (15 if b1=='LONG' else 0) + (12 if bull_sweep else 0) + (10 if bull_break else 0) + (8 if pos <= .45 else 0)
+    short_hint = (20 if b4=='SHORT' else 0) + (15 if b1=='SHORT' else 0) + (12 if bear_sweep else 0) + (10 if bear_break else 0) + (8 if pos >= .55 else 0)
+    hint = max(long_hint, short_hint)
+    return {'symbol': symbol, 'price': float(tm[symbol].get('lastPrice') or z.close),
+            'turnover24h': float(tm[symbol].get('turnover24h') or 0),
+            'spreadPct': float(((float(tm[symbol].get('ask1Price') or 0)-float(tm[symbol].get('bid1Price') or 0))/max(float(tm[symbol].get('lastPrice') or 1),1e-9))*100),
+            'htf_4h': b4, 'htf_1h': b1, 'hint': hint, 'frames': frames}
+
+
+def _deep_one(item, interval, btc_context):
+    symbol=item['symbol']; frames=item['frames']
+    frames['5'] = klines(symbol, '5', 180)
+    # Reuse the 15/60/240 frames already fetched in the technical stage.
+    return score(frames, interval, micro=None, live_price=item['price'], btc_context=btc_context)
+
+
+def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
+    if interval not in {'5', '15', '60'}:
+        raise ValueError('interval must be 5, 15 or 60')
+    universe, tm = _fast_market_universe()
+    if not universe:
+        return {'ok': True, 'mode':'paper-only', 'setup_interval':interval, 'universe_size':0, 'checked':0, 'technical_checked':0, 'deep_checked':0, 'micro_checked':0, 'results':[], 'failures':[]}
+
+    # Always include BTC if it is a valid market; it is a regime filter, not a trade candidate priority.
+    top = universe[:TECH_CANDIDATES]
+    btc_row = next((x for x in universe if x['symbol']=='BTCUSDT'), None)
+    if btc_row and all(x['symbol']!='BTCUSDT' for x in top):
+        top[-1] = btc_row
+
+    preliminary=[]; failures=[]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures={ex.submit(_technical_one,x['symbol'],interval,tm):x['symbol'] for x in top}
         for fut in as_completed(futures):
-            s = futures[fut]
-            try:
-                a = fut.result(); a.update({'symbol': s, 'turnover24h': turnover.get(s, 0)}); preliminary.append(a)
-            except Exception as e: failures.append({'symbol': s, 'error': str(e)})
-    preliminary.sort(key=lambda x: x['score'], reverse=True)
-    enrich_symbols = [x['symbol'] for x in preliminary[:min(6, len(preliminary))]]
-    if 'BTCUSDT' in symbols and 'BTCUSDT' not in enrich_symbols: enrich_symbols.append('BTCUSDT')
-    micro_map = {}
-    with ThreadPoolExecutor(max_workers=min(4, len(enrich_symbols) or 1)) as ex:
-        futures = {ex.submit(flow_features, s): s for s in enrich_symbols}
+            s=futures[fut]
+            try: preliminary.append(fut.result())
+            except Exception as e: failures.append({'symbol':s,'stage':'technical','error':str(e)})
+    preliminary.sort(key=lambda x:(x['hint'], x['turnover24h']), reverse=True)
+
+    # Deep pass on only the strongest technical candidates.
+    deep=preliminary[:DEEP_CANDIDATES]
+    btc_item=next((x for x in preliminary if x['symbol']=='BTCUSDT'),None)
+    if btc_item and all(x['symbol']!='BTCUSDT' for x in deep): deep[-1]=btc_item
+    btc_context={'symbol':'BTCUSDT','b4':btc_item['htf_4h'],'b1':btc_item['htf_1h']} if btc_item else None
+    scored=[]
+    for item in deep:
+        try:
+            a=_deep_one(item,interval,btc_context); a.update({'symbol':item['symbol'],'turnover24h':item['turnover24h'],'enriched':False}); scored.append(a)
+        except Exception as e: failures.append({'symbol':item['symbol'],'stage':'deep','error':str(e)})
+
+    scored.sort(key=lambda x:x['score'], reverse=True)
+    micro_targets=[x for x in scored if x['symbol']!='BTCUSDT'][:MICRO_CANDIDATES]
+    if not micro_targets and scored: micro_targets=scored[:MICRO_CANDIDATES]
+    micro_map={}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures={ex.submit(flow_features,x['symbol']):x['symbol'] for x in micro_targets}
         for fut in as_completed(futures):
-            s = futures[fut]
-            try: micro_map[s] = fut.result()
-            except Exception: micro_map[s] = {}
-    btc_ctx = next((x for x in preliminary if x['symbol'] == 'BTCUSDT'), None)
-    btc_context = {'symbol': 'BTCUSDT', 'b4': btc_ctx['htf_4h'], 'b1': btc_ctx['htf_1h']} if btc_ctx else None
-    results = []
-    for x in preliminary:
-        s = x['symbol']
+            s=futures[fut]
+            try: micro_map[s]=fut.result()
+            except Exception as e: failures.append({'symbol':s,'stage':'micro','error':str(e)})
+
+    results=[]
+    for x in scored:
+        s=x['symbol']
         if s in micro_map:
             try:
-                frames = {k: klines(s, k, 220) for k in ['5', '15', '60', '240']}
-                a = score(frames, interval, micro=micro_map[s], live_price=float(tm[s].get('lastPrice') or 0), btc_context=btc_context)
-                a.update({'symbol': s, 'turnover24h': turnover.get(s, 0), 'enriched': True}); results.append(a); continue
-            except Exception: pass
-        x['enriched'] = False; results.append(x)
-    results.sort(key=lambda x: x['score'], reverse=True)
-    return {'ok': True, 'mode': 'paper-only', 'setup_interval': interval, 'checked': len(symbols), 'results': results, 'failures': failures}
-
+                # Frames are still held in the deep item, avoiding duplicate candle calls.
+                item=next(i for i in deep if i['symbol']==s)
+                a=score(item['frames'],interval,micro=micro_map[s],live_price=item['price'],btc_context=btc_context)
+                a.update({'symbol':s,'turnover24h':x['turnover24h'],'enriched':True}); results.append(a)
+                continue
+            except Exception as e: failures.append({'symbol':s,'stage':'rescore','error':str(e)})
+        x.pop('frames',None); results.append(x)
+    results.sort(key=lambda x:x.get('score',x.get('hint',0)), reverse=True)
+    return {'ok':True,'mode':'paper-only','setup_interval':interval,
+            'universe_size':len(universe),'checked':len(top),'technical_checked':len(preliminary),
+            'deep_checked':len(deep),'micro_checked':len(micro_map),
+            'results':results,'failures':failures,
+            'scan_policy':{'universe':'all active USDT linear perpetuals','technical_cap':TECH_CANDIDATES,
+                           'deep_cap':DEEP_CANDIDATES,'micro_cap':MICRO_CANDIDATES}}
 
 def _roll_day_locked():
     today = datetime.now(timezone.utc).date().isoformat()
@@ -439,7 +529,7 @@ def paper_state():
         wins = sum(1 for t in _state['trades'] if t.get('pnl', 0) > 0); losses = sum(1 for t in _state['trades'] if t.get('pnl', 0) < 0)
         s['win_rate'] = round(wins / max(1, wins + losses) * 100, 2)
         s['profit_factor'] = round(sum(max(0, t.get('pnl', 0)) for t in _state['trades']) / max(1e-9, sum(-min(0, t.get('pnl', 0)) for t in _state['trades'])), 2) if losses else None
-        s['open_count'] = len(_state['open']); s['assumptions'] = {'fee_rate': PAPER_FEE_RATE, 'slippage_rate': PAPER_SLIPPAGE_RATE}
+        s['open_count'] = len(_state['open']); s['leverage'] = LEVERAGE; s['risk_pct_default'] = RISK_PCT_DEFAULT; s['assumptions'] = {'fee_rate': PAPER_FEE_RATE, 'slippage_rate': PAPER_SLIPPAGE_RATE, 'leverage': LEVERAGE}
         return s
 
 
@@ -461,12 +551,17 @@ def paper_open(d):
         if any(x['symbol'] == symbol for x in _state['open']): raise ValueError('position for this symbol already open')
         risk = _state['balance'] * risk_pct / 100; dist = abs(entry - sl)
         qty = risk / dist
+        notional = entry * qty
+        margin_required = notional / LEVERAGE
+        if margin_required > _state['balance'] * 0.95:
+            # With a tiny account, reject positions whose margin would consume nearly all free balance.
+            raise ValueError('margin requirement too high for current $10-style paper balance')
         entry_exec = entry * (1 + PAPER_SLIPPAGE_RATE if side == 'LONG' else 1 - PAPER_SLIPPAGE_RATE)
         fee = entry_exec * qty * PAPER_FEE_RATE
         _state['balance'] -= fee
         trade = {'id': len(_state['trades']) + len(_state['open']) + 1, 'symbol': symbol, 'side': side, 'entry': entry,
                  'entry_exec': entry_exec, 'stop_loss': sl, 'take_profit': tp, 'qty': qty, 'risk_usdt': risk,
-                 'entry_fee': fee, 'opened_at': int(time.time() * 1000)}
+                 'entry_fee': fee, 'leverage': LEVERAGE, 'notional': notional, 'margin_required': margin_required, 'opened_at': int(time.time() * 1000)}
         _state['open'].append(trade); return paper_state()
 
 
@@ -506,7 +601,7 @@ def paper_mark_to_market():
 
 def paper_reset():
     with _lock:
-        _state['balance'] = 1000.0; _state['initial_balance'] = 1000.0; _state['trades'] = []; _state['open'] = []
-        _state['day'] = datetime.now(timezone.utc).date().isoformat(); _state['day_start_balance'] = 1000.0
-        _state['loss_streak'] = 0; _state['last_loss_at'] = 0; _state['peak_equity'] = 1000.0
+        _state['balance'] = START_BALANCE; _state['initial_balance'] = START_BALANCE; _state['trades'] = []; _state['open'] = []
+        _state['day'] = datetime.now(timezone.utc).date().isoformat(); _state['day_start_balance'] = START_BALANCE
+        _state['loss_streak'] = 0; _state['last_loss_at'] = 0; _state['peak_equity'] = START_BALANCE
         return paper_state()

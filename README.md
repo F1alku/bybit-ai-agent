@@ -1,37 +1,47 @@
-# Bybit AI Agent — Final Paper Quant
+# Bybit AI Agent — AUTO v5.2
 
-Mobile-first FastAPI scanner for Bybit Testnet USDT perpetuals.
+Paper-only Bybit Testnet market scanner. No real orders.
 
-## Safety
-- Paper-only. No private API keys and no real order endpoint.
-- Default risk: 0.5% per paper trade.
-- Max 2 open paper positions.
-- Daily loss lock: 2%.
-- 3 consecutive losses lock entries.
-- 30-minute cooldown after a loss.
-- Paper fees/slippage are simulated assumptions, not Bybit fee guarantees.
+## Current model
+- Entire active USDT-settled linear perpetual universe is discovered dynamically from Bybit.
+- One cheap market-wide ticker pass ranks the full universe.
+- Technical pass: up to 24 liquid candidates, using 4H + 1H + setup timeframe.
+- Deep pass: top 8 candidates, adding 5M and full entry scoring.
+- Microstructure pass: top 4 candidates, adding OI, order-book imbalance, trade delta, funding and spread.
+- BTC is always included as a market-regime filter when available.
+- Expensive calls are not made for every contract.
+- Instrument metadata is cached for 10 minutes; market data uses short caching.
 
-## Strategy
-4H/1H context → setup timeframe → liquidity sweep/structure → discount/premium → VWAP/volume → 5M momentum → RSI → OI → order-book imbalance → taker trade delta → funding → spread/volatility → BTC regime → risk gate.
+## Paper account
+- Starting balance: $10
+- Minimum leverage: 10x (paper simulation)
+- Default aggressive risk: 2% of current balance per trade
+- Maximum 2 open paper positions
+- Mandatory SL/TP
+- No averaging down
+- No martingale
+- Fees and slippage are simulated assumptions, not claims about actual Bybit fees.
 
-The agent can return WAIT even when the score is high if the hard entry gate is not satisfied.
+## Auto scanner
+- Runs every 3 minutes on Render.
+- It can inspect the entire market without the browser being open.
+- It only opens a paper trade when the existing entry gate is confirmed and score >= 70.
+- The 70 score is a current engineering threshold, not a guarantee; it can be recalibrated from paper-trade statistics.
+
+## API
+- GET `/`
+- GET `/api/health`
+- GET `/api/markets`
+- POST `/api/scan`
+- GET `/api/auto`
+- POST `/api/auto/toggle`
+- GET `/api/paper`
+- POST `/api/paper/open`
+- POST `/api/paper/update`
+- POST `/api/paper/reset`
 
 ## Run
-`pip install -r requirements.txt`
-`uvicorn app:app --host 0.0.0.0 --port 8000`
-
-## Render
-Build: `pip install -r requirements.txt`
-Start: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-
-## Important
-This is a rule-based quantitative scanner with microstructure inputs, not a trained ML model. Historical backtesting of the full microstructure layer requires archived OI/order-book/trade data; the current paper engine is the validation layer for live Testnet market data.
-
-
-## Auto Scanner 5.1
-- Автосканер включён по умолчанию в paper-only режиме.
-- Каждые 3 минуты обновляет paper-позиции, запускает Deep Scan 15M и при сигнале LONG/SHORT >= 70/100 автоматически открывает лучшую допустимую paper-сделку.
-- Максимум 2 одновременные позиции, риск 0.5%, действуют все защитные лимиты из paper engine.
-- Автосканер можно выключить/включить кнопкой в веб-интерфейсе.
-- Реальные ордера не используются.
-- Состояние paper хранится в памяти процесса и может сброситься при перезапуске Render.
+```bash
+pip install -r requirements.txt
+uvicorn app:app --host 0.0.0.0 --port $PORT
+```

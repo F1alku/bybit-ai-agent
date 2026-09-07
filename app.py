@@ -25,7 +25,7 @@ async def lifespan(_app):
         except asyncio.CancelledError:
             pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.1.0', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.2.0', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 def _auto_iteration():
@@ -42,7 +42,7 @@ def _auto_iteration():
             action = 'max 2 paper positions — monitoring'
             result = None
         else:
-            result = scan_market('15', 8)
+            result = scan_market('15', 24)
             candidates = [x for x in result.get('results', [])
                           if x.get('direction') in ('LONG', 'SHORT') and float(x.get('score', 0)) >= 70
                           and x.get('stop_loss') and x.get('take_profit')]
@@ -52,7 +52,7 @@ def _auto_iteration():
                 x = candidates[0]
                 try:
                     paper_open({'symbol': x['symbol'], 'side': x['direction'], 'entry': x['price'],
-                                'stop_loss': x['stop_loss'], 'take_profit': x['take_profit'], 'risk_pct': 0.5})
+                                'stop_loss': x['stop_loss'], 'take_profit': x['take_profit'], 'risk_pct': 2.0})
                     action = f"AUTO PAPER {x['direction']} {x['symbol']} {x['score']}/100"
                 except ValueError as e:
                     action = f"candidate rejected: {e}"
@@ -83,7 +83,7 @@ async def _auto_loop():
 
 class ScanRequest(BaseModel):
     interval: str = Field('15', pattern=r'^(5|15|60)$')
-    limit_symbols: int = Field(8, ge=3, le=12)
+    limit_symbols: int = Field(24, ge=3, le=24)
 
 class PaperOpenRequest(BaseModel):
     symbol: str
@@ -97,7 +97,7 @@ class PaperOpenRequest(BaseModel):
 def index(): return FileResponse('static/index.html')
 
 @app.get('/api/health')
-def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.1.0', 'mode': 'paper-only', 'auto_scanner': auto_state['enabled']}
+def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.2.0', 'mode': 'paper-only', 'auto_scanner': auto_state['enabled']}
 
 @app.get('/api/auto')
 def auto_status():
