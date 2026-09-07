@@ -47,7 +47,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.6.5'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.6.6'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -508,6 +508,24 @@ def _deep_one(item, interval, btc_context):
     return score(frames, interval, micro=None, live_price=item['price'], btc_context=btc_context)
 
 
+def _json_safe(value):
+    # Convert numpy/pandas scalar values and non-finite floats before FastAPI serialisation.
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if hasattr(value, 'item'):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
 def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
     if interval not in {'5', '15', '60'}:
         raise ValueError('interval must be 5, 15 or 60')
@@ -576,13 +594,13 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
             except Exception as e: failures.append({'symbol':s,'stage':'rescore','error':str(e)})
         x.pop('frames',None); results.append(x)
     results.sort(key=lambda x:x.get('score',x.get('hint',0)), reverse=True)
-    return {'ok':True,'mode':MODE,'setup_interval':interval,
+    return _json_safe({'ok':True,'mode':MODE,'setup_interval':interval,
             'universe_size':len(universe),'checked':len(top),'technical_checked':len(preliminary),'technical_target':len(top),'technical_skipped':max(0,len(top)-len(preliminary)),
             'deep_checked':len(deep),'deep_target':len(deep),'micro_checked':len(micro_map),'micro_target':len(micro_targets),
             'results':results,'failures':failures,
             'scan_policy':{'universe':'all active USDT linear perpetuals','technical_cap':TECH_CANDIDATES,
                            'deep_cap':DEEP_CANDIDATES,'micro_cap':MICRO_CANDIDATES,
-                           'optimization':'persistent HTTP connections + bounded concurrency + retry/backoff + cached public data'}}
+                           'optimization':'persistent HTTP connections + bounded concurrency + retry/backoff + cached public data'}})
 
 def _roll_day_locked():
     today = datetime.now(timezone.utc).date().isoformat()

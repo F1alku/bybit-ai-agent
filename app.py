@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 from contextlib import asynccontextmanager
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -33,8 +33,23 @@ async def lifespan(_app):
         except asyncio.CancelledError:
             pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.6.5', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.6.6', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
+
+@app.middleware('http')
+async def json_error_middleware(request, call_next):
+    # Never let an unexpected exception turn an API response into Render's HTML 500 page.
+    # The frontend can then always parse a JSON diagnostic and display the actual endpoint/error.
+    try:
+        return await call_next(request)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            'ok': False,
+            'error': str(e) or e.__class__.__name__,
+            'error_type': e.__class__.__name__,
+            'path': request.url.path,
+        })
+
 
 def _auto_iteration():
     with auto_lock:
@@ -151,7 +166,7 @@ class PaperOpenRequest(BaseModel):
 def index(): return FileResponse('static/index.html')
 
 @app.get('/api/health')
-def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.6.5', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
+def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.6.6', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
 
 @app.get('/api/auto')
 def auto_status():
@@ -181,7 +196,7 @@ def _run_scan_job(job_id, interval, limit_symbols):
             scan_jobs[job_id] = {'status': 'done', 'result': result}
     except Exception as e:
         with scan_jobs_lock:
-            scan_jobs[job_id] = {'status': 'error', 'error': str(e)}
+            scan_jobs[job_id] = {'status': 'error', 'error': str(e), 'error_type': e.__class__.__name__}
     finally:
         scan_lock.release()
 
@@ -210,15 +225,17 @@ def scan_status(job_id: str):
     with scan_jobs_lock:
         job = scan_jobs.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail='Результат скана не найден.')
+        return JSONResponse(status_code=404, content={'ok': False, 'job_id': job_id, 'status': 'not_found', 'error': 'Результат скана не найден.'})
     if job['status'] == 'error':
-        raise HTTPException(status_code=502, detail=job.get('error', 'scan failed'))
+        # Keep polling JSON-safe: do not raise HTTPException here because some proxies/render
+        # error paths can replace it with an HTML 500 page.
+        return {'ok': False, 'job_id': job_id, 'status': 'error', 'error': job.get('error', 'scan failed'), 'error_type': job.get('error_type', 'RuntimeError')}
     if job['status'] == 'running':
         return {'ok': True, 'job_id': job_id, 'status': 'running'}
-    
+
     result = job.get('result') or {}
     if not isinstance(result, dict):
-        raise HTTPException(status_code=502, detail='Скан вернул некорректный результат.')
+        return {'ok': False, 'job_id': job_id, 'status': 'error', 'error': 'Скан вернул некорректный результат.', 'error_type': 'InvalidScanResult'}
     # Keep a stable response contract for the browser even if a future engine version omits a field.
     result.setdefault('failures', [])
     result.setdefault('results', [])
