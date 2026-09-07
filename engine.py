@@ -17,9 +17,12 @@ MODE = os.getenv('BYBIT_MODE', 'paper').lower()
 BASE = 'https://api-demo.bybit.com' if MODE == 'demo' else 'https://api-testnet.bybit.com'
 DEMO_API_KEY = os.getenv('BYBIT_DEMO_API_KEY', '')
 DEMO_API_SECRET = os.getenv('BYBIT_DEMO_API_SECRET', '')
-TIMEOUT = 8.0
+TIMEOUT = 10.0
 CACHE_TTL = 20.0
-RETRY_COUNT = 1
+RETRY_COUNT = 2
+PRIVATE_RETRY_COUNT = 2
+DEMO_ACCOUNT_CACHE_TTL = 8.0
+DEMO_CLOSED_PNL_CACHE_TTL = 30.0
 MAX_POSITIONS = 4
 RISK_PCT_DEFAULT = 2.0
 LEVERAGE = 10.0
@@ -44,7 +47,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.6.3'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.6.5'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -94,24 +97,55 @@ def bybit_get(path, params):
         try:
             r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
             if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRY_COUNT:
-                time.sleep(0.35 * (attempt + 1)); continue
-            r.raise_for_status(); j = r.json()
-            if j.get('retCode') != 0: raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
+                time.sleep(0.45 * (2 ** attempt)); continue
+            r.raise_for_status()
+            try:
+                j = r.json()
+            except ValueError:
+                raise RuntimeError(f'Bybit returned invalid JSON (HTTP {r.status_code})')
+            if j.get('retCode') != 0:
+                raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
             return _put_cache(key, j.get('result', {}))
-        except httpx.HTTPStatusError as e: last_error = RuntimeError(f'Bybit HTTP {e.response.status_code}')
-        except httpx.RequestError as e: last_error = RuntimeError(f'Bybit connection error: {e}')
-        except ValueError: last_error = RuntimeError('Bybit returned invalid JSON')
-        except RuntimeError as e: last_error = e
-        if attempt < RETRY_COUNT: time.sleep(0.35 * (attempt + 1))
+        except httpx.HTTPStatusError as e:
+            last_error = RuntimeError(f'Bybit HTTP {e.response.status_code}')
+        except httpx.RequestError as e:
+            last_error = RuntimeError(f'Bybit connection error: {e}')
+        except RuntimeError as e:
+            last_error = e
+        if attempt < RETRY_COUNT:
+            time.sleep(0.45 * (2 ** attempt))
     raise last_error or RuntimeError('Bybit request failed')
 
 def bybit_private_post(path, body):
     if MODE != 'demo': raise RuntimeError('Private Bybit API is disabled in paper mode')
     if not DEMO_API_KEY or not DEMO_API_SECRET: raise RuntimeError('Demo API key/secret are not configured')
-    r = _http.post(BASE + path, json=body, headers={**_auth_headers('POST', path, body), 'Content-Type':'application/json'})
-    r.raise_for_status(); j = r.json()
-    if j.get('retCode') != 0: raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
-    return j.get('result', {})
+    # Never blindly retry order creation: a network timeout can happen after Bybit accepted
+    # the order, and a retry could create a duplicate. Non-order control endpoints are safe
+    # to retry on transient transport/server failures.
+    attempts = 1 if path == '/v5/order/create' else (PRIVATE_RETRY_COUNT + 1)
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            r = _http.post(BASE + path, json=body, headers={**_auth_headers('POST', path, body), 'Content-Type':'application/json'})
+            if r.status_code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
+                time.sleep(0.45 * (2 ** attempt)); continue
+            r.raise_for_status()
+            try:
+                j = r.json()
+            except ValueError:
+                raise RuntimeError(f'Bybit returned invalid JSON (HTTP {r.status_code})')
+            if j.get('retCode') != 0:
+                raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
+            return j.get('result', {})
+        except httpx.HTTPStatusError as e:
+            last_error = RuntimeError(f'Bybit HTTP {e.response.status_code}')
+        except httpx.RequestError as e:
+            last_error = RuntimeError(f'Bybit connection error: {e}')
+        except RuntimeError as e:
+            last_error = e
+        if attempt + 1 < attempts:
+            time.sleep(0.45 * (2 ** attempt))
+    raise last_error or RuntimeError('Bybit private request failed')
 
 
 def tickers():
@@ -492,8 +526,15 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
         futures={ex.submit(_technical_one,x['symbol'],interval,tm):x['symbol'] for x in top}
         for fut in as_completed(futures):
             s=futures[fut]
-            try: preliminary.append(fut.result())
-            except Exception as e: failures.append({'symbol':s,'stage':'technical','error':str(e)})
+            try:
+                preliminary.append(fut.result())
+            except Exception as first_error:
+                # A single candle request can fail transiently even when the public API is healthy.
+                # Retry the symbol once outside the pool so one blip does not poison the whole scan.
+                try:
+                    preliminary.append(_technical_one(s, interval, tm))
+                except Exception as second_error:
+                    failures.append({'symbol':s,'stage':'technical','error':str(second_error),'retry_error':str(first_error)})
     preliminary.sort(key=lambda x:(x['hint'], x['turnover24h']), reverse=True)
 
     # Deep pass on only the strongest technical candidates.
@@ -536,8 +577,8 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
         x.pop('frames',None); results.append(x)
     results.sort(key=lambda x:x.get('score',x.get('hint',0)), reverse=True)
     return {'ok':True,'mode':MODE,'setup_interval':interval,
-            'universe_size':len(universe),'checked':len(top),'technical_checked':len(preliminary),
-            'deep_checked':len(deep),'micro_checked':len(micro_map),
+            'universe_size':len(universe),'checked':len(top),'technical_checked':len(preliminary),'technical_target':len(top),'technical_skipped':max(0,len(top)-len(preliminary)),
+            'deep_checked':len(deep),'deep_target':len(deep),'micro_checked':len(micro_map),'micro_target':len(micro_targets),
             'results':results,'failures':failures,
             'scan_policy':{'universe':'all active USDT linear perpetuals','technical_cap':TECH_CANDIDATES,
                            'deep_cap':DEEP_CANDIDATES,'micro_cap':MICRO_CANDIDATES,
@@ -570,25 +611,71 @@ def set_paper_budget(amount):
         return paper_state()
 
 
-def bybit_private_get(path, params):
+_private_cache = {}
+_private_cache_lock = threading.RLock()
+_demo_last_good_state = None
+
+def _private_cached(key, ttl):
+    with _private_cache_lock:
+        item = _private_cache.get(key)
+        if item and time.time() - item[0] < ttl:
+            return item[1]
+    return None
+
+def _private_put(key, value):
+    with _private_cache_lock:
+        _private_cache[key] = (time.time(), value)
+    return value
+
+def bybit_private_get(path, params, retries=PRIVATE_RETRY_COUNT):
     if MODE != 'demo': raise RuntimeError('Private Bybit API is disabled in paper mode')
     if not DEMO_API_KEY or not DEMO_API_SECRET: raise RuntimeError('Demo API key/secret are not configured')
-    r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
-    r.raise_for_status(); j = r.json()
-    if j.get('retCode') != 0: raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
-    return j.get('result', {})
-
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(0.5 * (2 ** attempt)); continue
+            r.raise_for_status()
+            try:
+                j = r.json()
+            except ValueError:
+                raise RuntimeError(f'Bybit returned invalid JSON (HTTP {r.status_code})')
+            if j.get('retCode') != 0:
+                raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
+            return j.get('result', {})
+        except httpx.HTTPStatusError as e:
+            last_error = RuntimeError(f'Bybit HTTP {e.response.status_code}')
+        except httpx.RequestError as e:
+            last_error = RuntimeError(f'Bybit connection error: {e}')
+        except RuntimeError as e:
+            last_error = e
+        if attempt < retries:
+            time.sleep(0.5 * (2 ** attempt))
+    raise last_error or RuntimeError('Bybit private request failed')
 
 def _demo_wallet():
-    return bybit_private_get('/v5/account/wallet-balance', {'accountType':'UNIFIED','coin':'USDT'})
-
+    key = ('wallet',)
+    cached = _private_cached(key, DEMO_ACCOUNT_CACHE_TTL)
+    return cached if cached is not None else _private_put(key, bybit_private_get('/v5/account/wallet-balance', {'accountType':'UNIFIED','coin':'USDT'}))
 
 def _demo_positions():
-    return bybit_private_get('/v5/position/list', {'category':'linear','settleCoin':'USDT'}).get('list', [])
-
+    key = ('positions',)
+    cached = _private_cached(key, DEMO_ACCOUNT_CACHE_TTL)
+    if cached is not None: return cached
+    return _private_put(key, bybit_private_get('/v5/position/list', {'category':'linear','settleCoin':'USDT'}).get('list', []))
 
 def _demo_closed_pnl(limit=100):
-    return bybit_private_get('/v5/position/closed-pnl', {'category':'linear','limit':min(int(limit), 100)}).get('list', [])
+    key = ('closed_pnl', min(int(limit), 100))
+    cached = _private_cached(key, DEMO_CLOSED_PNL_CACHE_TTL)
+    if cached is not None: return cached
+    return _private_put(key, bybit_private_get('/v5/position/closed-pnl', {'category':'linear','limit':min(int(limit), 100)}).get('list', []))
+
+def _invalidate_demo_account_cache():
+    with _private_cache_lock:
+        for key in list(_private_cache):
+            if key and key[0] in {'wallet','positions','closed_pnl'}:
+                _private_cache.pop(key, None)
 
 
 def _demo_pnl_snapshot(wallet, positions, closed):
@@ -683,38 +770,61 @@ def demo_open(d):
         'tpTriggerBy':'MarkPrice','slTriggerBy':'MarkPrice','orderLinkId':f'ai-{int(time.time()*1000)}'
     }
     result = bybit_private_post('/v5/order/create', order)
+    _invalidate_demo_account_cache()
     return {'mode':'demo','ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'order':result}
 
 
 def demo_state():
+    global _demo_last_good_state
     if MODE != 'demo': return {'mode':'paper','configured':False}
     if not DEMO_API_KEY or not DEMO_API_SECRET:
         return {'mode':'demo','configured':False,'error':'BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET missing'}
+    warnings = []
     try:
         wallet = _demo_wallet()
-        positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
-        closed = _demo_closed_pnl(100)
-        acct = (wallet.get('list') or [{}])[0]
-        coin = next((x for x in acct.get('coin', []) if x.get('coin') == 'USDT'), {})
-        equity = float(acct.get('totalEquity') or 0)
-        usdt_wallet = float(coin.get('walletBalance') or 0)
-        available_margin = float(acct.get('totalAvailableBalance') or 0)
-        snap = _demo_pnl_snapshot(wallet, positions, closed)
-        daily_loss = snap['daily_loss']
-        locked = daily_loss >= DEMO_MAX_DAILY_LOSS
-        budget = max(0.0, DEMO_TRADING_BUDGET)
-        bot_available = max(0.0, min(budget - snap['reserved_margin'], available_margin))
-        return {
-            'mode':'demo','configured':True,'wallet':wallet,'positions':positions,'closed_pnl':closed[:20],
-            'max_positions':MAX_POSITIONS,'trading_budget':budget,'bot_available_budget':round(bot_available, 6),
-            'reserved_margin':snap['reserved_margin'],'daily_loss_limit':DEMO_MAX_DAILY_LOSS,'daily_loss':daily_loss,
-            'daily_pnl':snap['daily_pnl'],'realized_pnl_today':snap['realized_pnl_today'],
-            'realized_pnl_7d':snap['realized_pnl_7d'],'unrealized_pnl':snap['unrealized_pnl'],
-            'total_pnl_7d':snap['total_pnl_7d'],'equity':equity,'usdt_wallet_balance':usdt_wallet,
-            'available_margin':available_margin,'risk_pct':DEMO_RISK_PCT,'leverage':LEVERAGE,'risk_locked':locked,
-        }
     except Exception as e:
-        return {'mode':'demo','configured':True,'error':str(e)}
+        # Do not replace a valid last-known account view with zeros during a transient
+        # Bybit/network failure. Returning stale-but-explicit data keeps the UI trustworthy.
+        if _demo_last_good_state is not None:
+            stale = dict(_demo_last_good_state)
+            stale['degraded'] = True
+            stale['stale'] = True
+            stale['warnings'] = list(stale.get('warnings') or []) + [f'Баланс временно не обновлён: {e}']
+            return stale
+        return {'mode':'demo','configured':True,'degraded':True,'error':'wallet_sync_failed','error_detail':str(e),'warnings':['Не удалось получить баланс Demo. Повторная попытка будет выполнена автоматически.']}
+    try:
+        positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
+    except Exception as e:
+        positions = []
+        warnings.append(f'Позиции временно недоступны: {e}')
+    try:
+        closed = _demo_closed_pnl(100)
+    except Exception as e:
+        closed = []
+        warnings.append(f'История P&L временно недоступна: {e}')
+
+    acct = (wallet.get('list') or [{}])[0]
+    coin = next((x for x in acct.get('coin', []) if x.get('coin') == 'USDT'), {})
+    equity = float(acct.get('totalEquity') or 0)
+    usdt_wallet = float(coin.get('walletBalance') or 0)
+    available_margin = float(acct.get('totalAvailableBalance') or 0)
+    snap = _demo_pnl_snapshot(wallet, positions, closed)
+    daily_loss = snap['daily_loss']
+    locked = daily_loss >= DEMO_MAX_DAILY_LOSS
+    budget = max(0.0, DEMO_TRADING_BUDGET)
+    bot_available = max(0.0, min(budget - snap['reserved_margin'], available_margin))
+    state = {
+        'mode':'demo','configured':True,'degraded':bool(warnings),'stale':False,'warnings':warnings,
+        'wallet':wallet,'positions':positions,'closed_pnl':closed[:20],
+        'max_positions':MAX_POSITIONS,'trading_budget':budget,'bot_available_budget':round(bot_available, 6),
+        'reserved_margin':snap['reserved_margin'],'daily_loss_limit':DEMO_MAX_DAILY_LOSS,'daily_loss':daily_loss,
+        'daily_pnl':snap['daily_pnl'],'realized_pnl_today':snap['realized_pnl_today'],
+        'realized_pnl_7d':snap['realized_pnl_7d'],'unrealized_pnl':snap['unrealized_pnl'],
+        'total_pnl_7d':snap['total_pnl_7d'],'equity':equity,'usdt_wallet_balance':usdt_wallet,
+        'available_margin':available_margin,'risk_pct':DEMO_RISK_PCT,'leverage':LEVERAGE,'risk_locked':locked,
+    }
+    _demo_last_good_state = dict(state)
+    return state
 
 def demo_account_state():
     return demo_state()

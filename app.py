@@ -33,7 +33,7 @@ async def lifespan(_app):
         except asyncio.CancelledError:
             pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.6.3', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.6.5', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 def _auto_iteration():
@@ -151,7 +151,7 @@ class PaperOpenRequest(BaseModel):
 def index(): return FileResponse('static/index.html')
 
 @app.get('/api/health')
-def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.6.3', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
+def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.6.5', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
 
 @app.get('/api/auto')
 def auto_status():
@@ -224,8 +224,11 @@ def scan_status(job_id: str):
     result.setdefault('results', [])
     result.setdefault('universe_size', 0)
     result.setdefault('technical_checked', 0)
+    result.setdefault('technical_target', result.get('technical_checked', 0))
+    result.setdefault('technical_skipped', max(0, result.get('technical_target', 0) - result.get('technical_checked', 0)))
     result.setdefault('deep_checked', 0)
     result.setdefault('micro_checked', 0)
+    result.setdefault('micro_target', result.get('micro_checked', 0))
     return {'ok': True, 'job_id': job_id, 'status': 'done', **result}
 
 @app.get('/api/paper')
@@ -255,7 +258,10 @@ def open_paper(req: PaperOpenRequest):
 def update_paper(): return demo_state() if MODE == 'demo' else paper_mark_to_market()
 
 @app.post('/api/paper/reset')
-def reset_paper(): return paper_reset()
+def reset_paper():
+    if MODE == 'demo':
+        raise HTTPException(status_code=409, detail='Сброс PAPER недоступен в DEMO режиме')
+    return paper_reset()
 
 class BudgetRequest(BaseModel):
     amount: float = Field(gt=0)

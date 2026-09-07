@@ -1,4 +1,4 @@
-# Bybit AI Agent — v5.6.4 DEMO
+# Bybit AI Agent — v5.6.5 DEMO
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
