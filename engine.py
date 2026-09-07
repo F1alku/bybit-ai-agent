@@ -8,31 +8,48 @@ from typing import Dict, Optional
 import httpx
 import pandas as pd
 
-BASE = 'https://api-testnet.bybit.com'
-TIMEOUT = 15.0
-CACHE_TTL = 8.0
-MAX_POSITIONS = 2
+import os
+import hashlib
+import hmac
+import json
+
+MODE = os.getenv('BYBIT_MODE', 'paper').lower()
+BASE = 'https://api-demo.bybit.com' if MODE == 'demo' else 'https://api-testnet.bybit.com'
+DEMO_API_KEY = os.getenv('BYBIT_DEMO_API_KEY', '')
+DEMO_API_SECRET = os.getenv('BYBIT_DEMO_API_SECRET', '')
+TIMEOUT = 8.0
+CACHE_TTL = 20.0
+RETRY_COUNT = 1
+MAX_POSITIONS = 4
 RISK_PCT_DEFAULT = 2.0
 LEVERAGE = 10.0
 START_BALANCE = 10.0
+DEMO_TRADING_BUDGET = float(os.getenv('DEMO_TRADING_BUDGET', '100'))
+DEMO_MAX_DAILY_LOSS = float(os.getenv('DEMO_MAX_DAILY_LOSS', '20'))
+DEMO_RISK_PCT = float(os.getenv('DEMO_RISK_PCT', '2'))
 
 # Scan budget: broad market discovery is one ticker request; expensive candle/microstructure
 # calls are reserved for a small ranked subset.
 TECH_CANDIDATES = 24
-DEEP_CANDIDATES = 8
-MICRO_CANDIDATES = 4
+DEEP_CANDIDATES = 12
+MICRO_CANDIDATES = 6
 INSTRUMENT_CACHE_TTL = 600.0
-DAILY_LOSS_LIMIT_PCT = 2.0
+DAILY_LOSS_LIMIT_PCT = 6.0
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_COOLDOWN_SEC = 30 * 60
+ENTRY_SCORE_MIN = 70
+MAX_MARGIN_FRACTION = 0.95
 # Simulation assumptions only; change them when you know the fee/slippage model you want.
 PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.3'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
+    'trading_budget': START_BALANCE,
+    'reserved_margin': 0.0,
     'initial_balance': START_BALANCE,
     'trades': [],
     'open': [],
@@ -41,7 +58,10 @@ _state = {
     'loss_streak': 0,
     'last_loss_at': 0,
     'peak_equity': START_BALANCE,
+    'mark_prices': {},
 }
+
+_demo_guard = {'day': datetime.now(timezone.utc).date().isoformat(), 'start_equity': None}
 
 
 def _cached(key):
@@ -56,25 +76,42 @@ def _put_cache(key, value):
     return value
 
 
+def _auth_headers(method, path, payload):
+    if MODE != 'demo' or not DEMO_API_KEY or not DEMO_API_SECRET:
+        return {}
+    ts = str(int(time.time() * 1000)); recv = '5000'
+    from urllib.parse import urlencode
+    body = urlencode(sorted(payload.items())) if method == 'GET' else json.dumps(payload, separators=(',', ':'))
+    sign = hmac.new(DEMO_API_SECRET.encode(), (ts + DEMO_API_KEY + recv + body).encode(), hashlib.sha256).hexdigest()
+    return {'X-BAPI-API-KEY': DEMO_API_KEY, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': recv, 'X-BAPI-SIGN': sign}
+
 def bybit_get(path, params):
-    key = (path, tuple(sorted((str(k), str(v)) for k, v in params.items())))
+    key = (MODE, path, tuple(sorted((str(k), str(v)) for k, v in params.items())))
     cached = _cached(key)
-    if cached is not None:
-        return cached
-    try:
-        with httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.1'}) as c:
-            r = c.get(BASE + path, params=params)
-            r.raise_for_status()
-            j = r.json()
-    except httpx.HTTPStatusError as e:
-        raise RuntimeError(f'Bybit HTTP {e.response.status_code}') from e
-    except httpx.RequestError as e:
-        raise RuntimeError(f'Bybit connection error: {e}') from e
-    except ValueError as e:
-        raise RuntimeError('Bybit returned invalid JSON') from e
-    if j.get('retCode') != 0:
-        raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
-    return _put_cache(key, j.get('result', {}))
+    if cached is not None: return cached
+    last_error = None
+    for attempt in range(RETRY_COUNT + 1):
+        try:
+            r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRY_COUNT:
+                time.sleep(0.35 * (attempt + 1)); continue
+            r.raise_for_status(); j = r.json()
+            if j.get('retCode') != 0: raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
+            return _put_cache(key, j.get('result', {}))
+        except httpx.HTTPStatusError as e: last_error = RuntimeError(f'Bybit HTTP {e.response.status_code}')
+        except httpx.RequestError as e: last_error = RuntimeError(f'Bybit connection error: {e}')
+        except ValueError: last_error = RuntimeError('Bybit returned invalid JSON')
+        except RuntimeError as e: last_error = e
+        if attempt < RETRY_COUNT: time.sleep(0.35 * (attempt + 1))
+    raise last_error or RuntimeError('Bybit request failed')
+
+def bybit_private_post(path, body):
+    if MODE != 'demo': raise RuntimeError('Private Bybit API is disabled in paper mode')
+    if not DEMO_API_KEY or not DEMO_API_SECRET: raise RuntimeError('Demo API key/secret are not configured')
+    r = _http.post(BASE + path, json=body, headers={**_auth_headers('POST', path, body), 'Content-Type':'application/json'})
+    r.raise_for_status(); j = r.json()
+    if j.get('retCode') != 0: raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
+    return j.get('result', {})
 
 
 def tickers():
@@ -348,8 +385,8 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None):
                   and not spread_bad and not volatility_bad and not btc_block_short)
 
     direction = 'WAIT'; best = max(ls, ss)
-    if ls >= 70 and ls > ss and long_gate: direction = 'LONG'
-    elif ss >= 70 and ss > ls and short_gate: direction = 'SHORT'
+    if ls >= ENTRY_SCORE_MIN and ls > ss and long_gate: direction = 'LONG'
+    elif ss >= ENTRY_SCORE_MIN and ss > ls and short_gate: direction = 'SHORT'
     price = float(live_price if live_price and live_price > 0 else z.close)
     if direction == 'LONG':
         sl = min(float(z.low), float(frames[setup].low.tail(20).min())) - 0.15 * atrv
@@ -359,7 +396,7 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None):
         tp = price - 2 * max(sl - price, atrv * 0.5); reasons = reasons_short
     else:
         sl = tp = None; reasons = reasons_long if ls >= ss else reasons_short
-        reasons.append('entry gate not confirmed' if best >= 70 else 'score below 70')
+        reasons.append('entry gate not confirmed' if best >= ENTRY_SCORE_MIN else f'score below {ENTRY_SCORE_MIN}')
     rr = None
     if direction == 'LONG' and sl < price: rr = round((tp - price) / (price - sl), 2)
     elif direction == 'SHORT' and sl > price: rr = round((price - tp) / (sl - price), 2)
@@ -413,12 +450,13 @@ def _fast_market_universe():
 
 def _technical_one(symbol, interval, tm):
     # Cheap technical pass: 4H + 1H + setup. 5M and microstructure wait for the shortlist.
-    frames = {k: klines(symbol, k, 180) for k in ['15', '60', '240']}
+    setup = str(interval)
+    frames = {k: klines(symbol, k, 180) for k in sorted({'15', '60', '240', setup}, key=lambda x: ['5','15','60','240'].index(x))}
     b4, b1 = bias(frames['240']), bias(frames['60'])
-    f15 = frame_features(frames['15']); z = f15.iloc[-1]
-    bull_sweep, bear_sweep = sweep(frames['15'])
-    bull_break, bear_break = structure_confirmation(frames['15'])
-    hi, lo = frames['15'].high.tail(50).max(), frames['15'].low.tail(50).min()
+    fsetup = frame_features(frames[setup]); z = fsetup.iloc[-1]
+    bull_sweep, bear_sweep = sweep(frames[setup])
+    bull_break, bear_break = structure_confirmation(frames[setup])
+    hi, lo = frames[setup].high.tail(50).max(), frames[setup].low.tail(50).min()
     rng = max(float(hi-lo), 1e-12); pos = (float(z.close)-float(lo))/rng
     long_hint = (20 if b4=='LONG' else 0) + (15 if b1=='LONG' else 0) + (12 if bull_sweep else 0) + (10 if bull_break else 0) + (8 if pos <= .45 else 0)
     short_hint = (20 if b4=='SHORT' else 0) + (15 if b1=='SHORT' else 0) + (12 if bear_sweep else 0) + (10 if bear_break else 0) + (8 if pos >= .55 else 0)
@@ -441,7 +479,7 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
         raise ValueError('interval must be 5, 15 or 60')
     universe, tm = _fast_market_universe()
     if not universe:
-        return {'ok': True, 'mode':'paper-only', 'setup_interval':interval, 'universe_size':0, 'checked':0, 'technical_checked':0, 'deep_checked':0, 'micro_checked':0, 'results':[], 'failures':[]}
+        return {'ok': True, 'mode':MODE, 'setup_interval':interval, 'universe_size':0, 'checked':0, 'technical_checked':0, 'deep_checked':0, 'micro_checked':0, 'results':[], 'failures':[]}
 
     # Always include BTC if it is a valid market; it is a regime filter, not a trade candidate priority.
     top = universe[:TECH_CANDIDATES]
@@ -464,10 +502,14 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
     if btc_item and all(x['symbol']!='BTCUSDT' for x in deep): deep[-1]=btc_item
     btc_context={'symbol':'BTCUSDT','b4':btc_item['htf_4h'],'b1':btc_item['htf_1h']} if btc_item else None
     scored=[]
-    for item in deep:
-        try:
-            a=_deep_one(item,interval,btc_context); a.update({'symbol':item['symbol'],'turnover24h':item['turnover24h'],'enriched':False}); scored.append(a)
-        except Exception as e: failures.append({'symbol':item['symbol'],'stage':'deep','error':str(e)})
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures={ex.submit(_deep_one,item,interval,btc_context):item for item in deep}
+        for fut in as_completed(futures):
+            item=futures[fut]
+            try:
+                a=fut.result(); a.update({'symbol':item['symbol'],'turnover24h':item['turnover24h'],'enriched':False}); scored.append(a)
+            except Exception as e:
+                failures.append({'symbol':item['symbol'],'stage':'deep','error':str(e)})
 
     scored.sort(key=lambda x:x['score'], reverse=True)
     micro_targets=[x for x in scored if x['symbol']!='BTCUSDT'][:MICRO_CANDIDATES]
@@ -493,12 +535,13 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
             except Exception as e: failures.append({'symbol':s,'stage':'rescore','error':str(e)})
         x.pop('frames',None); results.append(x)
     results.sort(key=lambda x:x.get('score',x.get('hint',0)), reverse=True)
-    return {'ok':True,'mode':'paper-only','setup_interval':interval,
+    return {'ok':True,'mode':MODE,'setup_interval':interval,
             'universe_size':len(universe),'checked':len(top),'technical_checked':len(preliminary),
             'deep_checked':len(deep),'micro_checked':len(micro_map),
             'results':results,'failures':failures,
             'scan_policy':{'universe':'all active USDT linear perpetuals','technical_cap':TECH_CANDIDATES,
-                           'deep_cap':DEEP_CANDIDATES,'micro_cap':MICRO_CANDIDATES}}
+                           'deep_cap':DEEP_CANDIDATES,'micro_cap':MICRO_CANDIDATES,
+                           'optimization':'persistent HTTP connections + bounded concurrency + retry/backoff + cached public data'}}
 
 def _roll_day_locked():
     today = datetime.now(timezone.utc).date().isoformat()
@@ -507,7 +550,7 @@ def _roll_day_locked():
 
 
 def _paper_equity_locked(prices=None):
-    prices = prices or {}
+    prices = prices if prices is not None else _state.get('mark_prices', {})
     eq = _state['balance']; unreal = 0.0
     for t in _state['open']:
         p = prices.get(t['symbol'], t['entry'])
@@ -516,27 +559,162 @@ def _paper_equity_locked(prices=None):
     return eq + unreal, unreal
 
 
+def set_paper_budget(amount):
+    amount=float(amount)
+    with _lock:
+        if amount <= 0: raise ValueError('trading budget must be positive')
+        if amount > _state['balance']: raise ValueError('trading budget cannot exceed current balance')
+        reserved=sum(float(x.get('margin_required',0)) for x in _state['open'])
+        if amount + 1e-9 < reserved: raise ValueError(f'budget cannot be below reserved margin ${reserved:.4f}')
+        _state['trading_budget']=amount
+        return paper_state()
+
+
+def bybit_private_get(path, params):
+    if MODE != 'demo': raise RuntimeError('Private Bybit API is disabled in paper mode')
+    if not DEMO_API_KEY or not DEMO_API_SECRET: raise RuntimeError('Demo API key/secret are not configured')
+    r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
+    r.raise_for_status(); j = r.json()
+    if j.get('retCode') != 0: raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
+    return j.get('result', {})
+
+
+def _demo_wallet():
+    return bybit_private_get('/v5/account/wallet-balance', {'accountType':'UNIFIED','coin':'USDT'})
+
+
+def _demo_positions():
+    return bybit_private_get('/v5/position/list', {'category':'linear','settleCoin':'USDT'}).get('list', [])
+
+
+def _demo_available_usdt():
+    result = _demo_wallet()
+    lst = result.get('list', [])
+    if not lst: raise RuntimeError('Demo wallet returned no UNIFIED account')
+    acct = lst[0]
+    available = acct.get('totalAvailableBalance')
+    equity = acct.get('totalEquity')
+    if available is None:
+        for c in acct.get('coin', []):
+            if c.get('coin') == 'USDT':
+                available = c.get('availableToWithdraw') or c.get('walletBalance')
+                equity = equity or c.get('equity')
+                break
+    return float(available or 0), float(equity or 0), result
+
+
+def _demo_risk_qty(symbol, entry, sl):
+    available, equity, _ = _demo_available_usdt()
+    budget = min(DEMO_TRADING_BUDGET, available)
+    risk_cash = min(equity, budget) * DEMO_RISK_PCT / 100
+    dist = abs(entry - sl)
+    if dist <= 0: raise ValueError('invalid stop distance')
+    qty = risk_cash / dist
+    step, min_qty, max_qty = _symbol_rules(symbol)
+    qty = _round_step(qty, step) if step else qty
+    if max_qty > 0: qty = min(qty, max_qty)
+    margin = entry * qty / LEVERAGE
+    if margin > budget * MAX_MARGIN_FRACTION:
+        qty = _round_step((budget * MAX_MARGIN_FRACTION * LEVERAGE) / entry, step) if step else (budget * MAX_MARGIN_FRACTION * LEVERAGE) / entry
+        margin = entry * qty / LEVERAGE
+    if qty <= 0 or (min_qty > 0 and qty < min_qty):
+        raise ValueError(f'Demo position too small: available trading budget ${budget:.2f}')
+    return qty, margin, available, equity
+
+
+
+def _demo_guard_status(equity):
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _demo_guard['day'] != today or _demo_guard['start_equity'] is None:
+        _demo_guard['day'] = today
+        _demo_guard['start_equity'] = equity
+    loss = max(0.0, _demo_guard['start_equity'] - equity)
+    return loss, loss >= DEMO_MAX_DAILY_LOSS
+
+def demo_open(d):
+    if MODE != 'demo': raise ValueError('Demo mode is not enabled')
+    side = str(d['side']).upper(); symbol = str(d['symbol']).upper(); entry = float(d['entry']); sl = float(d['stop_loss']); tp = float(d['take_profit'])
+    if side not in ('LONG','SHORT'): raise ValueError('side must be LONG or SHORT')
+    positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
+    if len(positions) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} demo positions')
+    if any(x.get('symbol') == symbol for x in positions): raise ValueError('Demo position for this symbol already open')
+    qty, margin, available, equity = _demo_risk_qty(symbol, entry, sl)
+    daily_loss, locked = _demo_guard_status(equity)
+    if locked: raise ValueError(f'Demo daily loss limit reached: ${daily_loss:.2f} / ${DEMO_MAX_DAILY_LOSS:.2f}')
+    # Set leverage first. If account is already at the desired leverage, Bybit returns success.
+    bybit_private_post('/v5/position/set-leverage', {'category':'linear','symbol':symbol,'buyLeverage':str(int(LEVERAGE)),'sellLeverage':str(int(LEVERAGE))})
+    order = {
+        'category':'linear','symbol':symbol,'side':'Buy' if side == 'LONG' else 'Sell','orderType':'Market','qty':str(qty),
+        'positionIdx':0,'reduceOnly':False,'takeProfit':str(tp),'stopLoss':str(sl),
+        'tpTriggerBy':'MarkPrice','slTriggerBy':'MarkPrice','orderLinkId':f'ai-{int(time.time()*1000)}'
+    }
+    result = bybit_private_post('/v5/order/create', order)
+    return {'mode':'demo','ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'order':result}
+
+
+def demo_state():
+    if MODE != 'demo': return {'mode':'paper','configured':False}
+    if not DEMO_API_KEY or not DEMO_API_SECRET:
+        return {'mode':'demo','configured':False,'error':'BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET missing'}
+    try:
+        wallet = _demo_wallet()
+        positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
+        acct=(wallet.get('list') or [{}])[0]; equity=float(acct.get('totalEquity') or 0)
+        daily_loss, locked = _demo_guard_status(equity)
+        return {'mode':'demo','configured':True,'wallet':wallet,'positions':positions,'max_positions':MAX_POSITIONS,'trading_budget':DEMO_TRADING_BUDGET,'daily_loss_limit':DEMO_MAX_DAILY_LOSS,'daily_loss':daily_loss,'risk_pct':DEMO_RISK_PCT,'leverage':LEVERAGE,'risk_locked':locked}
+    except Exception as e:
+        return {'mode':'demo','configured':True,'error':str(e)}
+
+def demo_account_state():
+    return demo_state()
+
 def paper_state():
     with _lock:
         _roll_day_locked()
         s = {k: (v.copy() if isinstance(v, list) else v) for k, v in _state.items()}
-        s['pnl'] = round(s['balance'] - s['initial_balance'], 4)
-        s['return_pct'] = round(s['pnl'] / s['initial_balance'] * 100, 3)
+        realized_pnl = s['balance'] - s['initial_balance']
+        _, unrealized_pnl = _paper_equity_locked()
+        total_pnl = realized_pnl + unrealized_pnl
+        s['realized_pnl'] = round(realized_pnl, 4)
+        s['unrealized_pnl'] = round(unrealized_pnl, 4)
+        s['pnl'] = round(total_pnl, 4)
+        s['return_pct'] = round(total_pnl / s['initial_balance'] * 100, 3)
         daily_pnl = s['balance'] - s['day_start_balance']
         s['daily_pnl'] = round(daily_pnl, 4)
         s['daily_loss_pct'] = round(max(0.0, -daily_pnl) / max(s['day_start_balance'], 1e-9) * 100, 3)
+        for t in s['open']:
+            mark = s.get('mark_prices', {}).get(t['symbol'], t['entry'])
+            gross = (mark - t['entry']) * t['qty'] if t['side'] == 'LONG' else (t['entry'] - mark) * t['qty']
+            t['mark_price'] = round(mark, 10)
+            t['unrealized_pnl'] = round(gross, 6)
+            t['unrealized_pnl_pct'] = round(gross / max(t.get('margin_required', 1e-9), 1e-9) * 100, 3)
         s['risk_locked'] = s['daily_loss_pct'] >= DAILY_LOSS_LIMIT_PCT or s['loss_streak'] >= MAX_CONSECUTIVE_LOSSES
         wins = sum(1 for t in _state['trades'] if t.get('pnl', 0) > 0); losses = sum(1 for t in _state['trades'] if t.get('pnl', 0) < 0)
         s['win_rate'] = round(wins / max(1, wins + losses) * 100, 2)
         s['profit_factor'] = round(sum(max(0, t.get('pnl', 0)) for t in _state['trades']) / max(1e-9, sum(-min(0, t.get('pnl', 0)) for t in _state['trades'])), 2) if losses else None
-        s['open_count'] = len(_state['open']); s['leverage'] = LEVERAGE; s['risk_pct_default'] = RISK_PCT_DEFAULT; s['assumptions'] = {'fee_rate': PAPER_FEE_RATE, 'slippage_rate': PAPER_SLIPPAGE_RATE, 'leverage': LEVERAGE}
+        s['open_count'] = len(_state['open']); s['max_positions'] = MAX_POSITIONS; s['leverage'] = LEVERAGE; s['trading_budget'] = round(min(s.get('trading_budget', s['balance']), s['balance']), 6); s['reserved_margin'] = round(sum(float(x.get('margin_required',0)) for x in _state['open']), 6); s['available_margin_budget'] = round(max(0.0, s['trading_budget'] - s['reserved_margin']), 6); s['mode'] = MODE; s['risk_pct_default'] = RISK_PCT_DEFAULT; s['assumptions'] = {'fee_rate': PAPER_FEE_RATE, 'slippage_rate': PAPER_SLIPPAGE_RATE, 'leverage': LEVERAGE}
         return s
 
 
+def _round_step(value, step):
+    if not step or step <= 0: return value
+    return math.floor(value / step) * step
+
+def _symbol_rules(symbol):
+    try:
+        source = instruments()
+    except Exception:
+        return 0.0, 0.0, 0.0
+    for x in source:
+        if x.get('symbol') == symbol:
+            lot = x.get('lotSizeFilter') or {}
+            return float(lot.get('qtyStep') or 0), float(lot.get('minOrderQty') or 0), float(lot.get('maxOrderQty') or 0)
+    return 0.0, 0.0, 0.0
+
 def paper_open(d):
-    side = str(d['side']).upper(); symbol = str(d['symbol']).upper(); entry = float(d['entry']); sl = float(d['stop_loss']); tp = float(d['take_profit']); risk_pct = float(d['risk_pct'])
+    side = str(d['side']).upper(); symbol = str(d['symbol']).upper(); entry = float(d['entry']); sl = float(d['stop_loss']); tp = float(d['take_profit']); risk_pct = float(d.get('risk_pct', RISK_PCT_DEFAULT))
     if side not in ('LONG', 'SHORT'): raise ValueError('side must be LONG or SHORT')
-    if not symbol.endswith('USDT'): raise ValueError('paper symbol must be a USDT perpetual')
+    if not symbol.endswith('USDT'): raise ValueError('symbol must be a USDT perpetual')
     if entry <= 0 or sl <= 0 or tp <= 0: raise ValueError('prices must be positive')
     if not 0 < risk_pct <= 5: raise ValueError('risk_pct must be between 0 and 5')
     if side == 'LONG' and not (sl < entry < tp): raise ValueError('LONG requires SL < entry < TP')
@@ -547,22 +725,30 @@ def paper_open(d):
         if (_state['day_start_balance'] - _state['balance']) / max(_state['day_start_balance'], 1e-9) * 100 >= DAILY_LOSS_LIMIT_PCT: raise ValueError('daily loss limit reached')
         if _state['loss_streak'] >= MAX_CONSECUTIVE_LOSSES: raise ValueError('loss streak lock active')
         if _state['last_loss_at'] and time.time() - _state['last_loss_at'] < LOSS_COOLDOWN_SEC: raise ValueError('cooldown active after loss')
-        if len(_state['open']) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} open paper positions')
+        if len(_state['open']) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} open positions')
         if any(x['symbol'] == symbol for x in _state['open']): raise ValueError('position for this symbol already open')
-        risk = _state['balance'] * risk_pct / 100; dist = abs(entry - sl)
+        dist = abs(entry - sl); risk = _state['balance'] * risk_pct / 100
         qty = risk / dist
-        notional = entry * qty
-        margin_required = notional / LEVERAGE
-        if margin_required > _state['balance'] * 0.95:
-            # With a tiny account, reject positions whose margin would consume nearly all free balance.
-            raise ValueError('margin requirement too high for current $10-style paper balance')
+        step, min_qty, max_qty = _symbol_rules(symbol)
+        qty = _round_step(qty, step) if step else qty
+        if max_qty > 0: qty = min(qty, max_qty)
+        budget = min(_state.get('trading_budget', _state['balance']), _state['balance'])
+        reserved = sum(float(x.get('margin_required', 0)) for x in _state['open'])
+        free_budget = max(0.0, budget - reserved)
+        margin_required = entry * qty / LEVERAGE
+        if margin_required > free_budget * MAX_MARGIN_FRACTION:
+            allowed_margin = free_budget * MAX_MARGIN_FRACTION
+            qty = _round_step((allowed_margin * LEVERAGE) / entry, step) if step else (allowed_margin * LEVERAGE) / entry
+            margin_required = entry * qty / LEVERAGE
+            risk = qty * dist
+        if qty <= 0 or (min_qty > 0 and qty < min_qty): raise ValueError(f'position too small for available margin (${free_budget:.4f})')
         entry_exec = entry * (1 + PAPER_SLIPPAGE_RATE if side == 'LONG' else 1 - PAPER_SLIPPAGE_RATE)
         fee = entry_exec * qty * PAPER_FEE_RATE
+        if fee > _state['balance'] * 0.05: raise ValueError('entry fee would be too large for current balance')
         _state['balance'] -= fee
-        trade = {'id': len(_state['trades']) + len(_state['open']) + 1, 'symbol': symbol, 'side': side, 'entry': entry,
-                 'entry_exec': entry_exec, 'stop_loss': sl, 'take_profit': tp, 'qty': qty, 'risk_usdt': risk,
-                 'entry_fee': fee, 'leverage': LEVERAGE, 'notional': notional, 'margin_required': margin_required, 'opened_at': int(time.time() * 1000)}
-        _state['open'].append(trade); return paper_state()
+        trade = {'id': len(_state['trades']) + len(_state['open']) + 1, 'symbol': symbol, 'side': side, 'entry': entry, 'entry_exec': entry_exec, 'stop_loss': sl, 'take_profit': tp, 'qty': qty, 'risk_usdt': risk, 'entry_fee': fee, 'leverage': LEVERAGE, 'notional': entry*qty, 'margin_required': margin_required, 'opened_at': int(time.time()*1000)}
+        _state['open'].append(trade); _state['reserved_margin'] = sum(float(x.get('margin_required',0)) for x in _state['open'])
+        return paper_state()
 
 
 def paper_mark_to_market():
@@ -590,10 +776,11 @@ def paper_mark_to_market():
                 exit_fee = abs(exit_exec * trade['qty']) * PAPER_FEE_RATE
                 pnl -= exit_fee
                 rec = {**trade, 'exit': exit_price, 'exit_exec': exit_exec, 'exit_fee': exit_fee, 'pnl': round(pnl, 6), 'result': label, 'closed_at': int(time.time() * 1000)}
-                _state['balance'] += pnl; _state['trades'].append(rec); _state['open'].remove(trade)
+                _state['balance'] += pnl; _state['trades'].append(rec); _state['open'].remove(trade); _state['reserved_margin'] = sum(float(x.get('margin_required',0)) for x in _state['open'])
                 if pnl < 0: _state['loss_streak'] += 1; _state['last_loss_at'] = time.time()
                 else: _state['loss_streak'] = 0
                 closed.append(rec)
+        _state['mark_prices'] = mp
         equity, unreal = _paper_equity_locked(mp); _state['peak_equity'] = max(_state['peak_equity'], equity)
     out = paper_state(); out['equity'] = round(equity, 6); out['unrealized_pnl'] = round(unreal, 6); out['drawdown_pct'] = round(max(0, (_state['peak_equity'] - equity) / max(_state['peak_equity'], 1e-9) * 100), 3)
     return {'state': out, 'closed': closed}
@@ -601,7 +788,7 @@ def paper_mark_to_market():
 
 def paper_reset():
     with _lock:
-        _state['balance'] = START_BALANCE; _state['initial_balance'] = START_BALANCE; _state['trades'] = []; _state['open'] = []
+        _state['balance'] = START_BALANCE; _state['initial_balance'] = START_BALANCE; _state['trading_budget'] = START_BALANCE; _state['reserved_margin'] = 0.0; _state['trades'] = []; _state['open'] = []
         _state['day'] = datetime.now(timezone.utc).date().isoformat(); _state['day_start_balance'] = START_BALANCE
-        _state['loss_streak'] = 0; _state['last_loss_at'] = 0; _state['peak_equity'] = START_BALANCE
+        _state['loss_streak'] = 0; _state['last_loss_at'] = 0; _state['peak_equity'] = START_BALANCE; _state['mark_prices'] = {}
         return paper_state()

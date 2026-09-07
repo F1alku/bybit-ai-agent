@@ -45,3 +45,24 @@ Paper-only Bybit Testnet market scanner. No real orders.
 pip install -r requirements.txt
 uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
+
+
+## v5.4 changes
+- Full active USDT-settled linear perpetual universe -> 24 technical -> 12 deep -> 6 micro.
+- Up to 4 simultaneous paper positions when independent signals qualify.
+- Dynamic margin allocation: if ideal position does not fit the trading budget, quantity is reduced to available margin instead of immediately rejecting the signal.
+- Trading budget / reserved margin / available margin are exposed in paper state.
+- Default paper budget remains $10; it can be changed through `/api/paper/budget` up to current balance.
+- Demo-ready API layer uses `https://api-demo.bybit.com` when `BYBIT_MODE=demo`; API keys are read only from environment variables. No keys are stored in the repository.
+- `/api/account` reports Demo wallet status when Demo mode is configured.
+- Real Demo order execution is intentionally not enabled by default; PAPER remains the safe default.
+
+
+## Demo mode
+- `BYBIT_MODE=demo` uses Bybit Demo Trading at `https://api-demo.bybit.com`.
+- Set `BYBIT_DEMO_API_KEY` and `BYBIT_DEMO_API_SECRET` only as Render environment secrets; never commit them.
+- `AUTO_ENABLED=false` by default in Demo. Enable AUTO only after `/api/account` shows `configured=true`.
+- Demo trading budget defaults to $100, daily loss limit $20, risk 2%, leverage 10x, max 4 positions.
+- Demo orders are real orders inside Bybit Demo, with server-side TP/SL.
+- Public market data remains from Bybit mainnet public streams/endpoints as specified by Bybit Demo documentation.
+- Demo API keys are separate from Testnet keys.

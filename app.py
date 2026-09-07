@@ -1,17 +1,20 @@
 from fastapi import FastAPI, HTTPException
 import asyncio
 import threading
+import os
 import time
 from contextlib import asynccontextmanager
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market
+from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open
 
 AUTO_INTERVAL_SEC = 180
+SCAN_CANDIDATES = 24
 auto_lock = threading.RLock()
-auto_state = {'enabled': True, 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None}
+scan_lock = threading.Lock()
+auto_state = {'enabled': os.getenv('AUTO_ENABLED','false' if MODE=='demo' else 'true').lower() == 'true', 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0}
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -25,7 +28,7 @@ async def lifespan(_app):
         except asyncio.CancelledError:
             pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.2.0', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.5.0', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 def _auto_iteration():
@@ -33,34 +36,80 @@ def _auto_iteration():
         if not auto_state['enabled']:
             return
     try:
-        mark = paper_mark_to_market()
-        state = paper_state()
-        if state.get('risk_locked'):
-            action = 'risk lock active — no new paper entry'
-            result = None
-        elif len(state.get('open', [])) >= 2:
-            action = 'max 2 paper positions — monitoring'
-            result = None
-        else:
-            result = scan_market('15', 24)
-            candidates = [x for x in result.get('results', [])
-                          if x.get('direction') in ('LONG', 'SHORT') and float(x.get('score', 0)) >= 70
-                          and x.get('stop_loss') and x.get('take_profit')]
-            candidates.sort(key=lambda x: float(x.get('score', 0)), reverse=True)
-            action = 'scan complete — no entry'
-            if candidates:
-                x = candidates[0]
+        if MODE == 'demo':
+            state = demo_state()
+            if not state.get('configured'):
+                action = 'Demo API not configured'
+                result = None
+            elif state.get('error'):
+                action = 'Demo sync error'
+                result = None
+            elif len(state.get('positions', [])) >= 4:
+                action = 'max 4 demo positions — monitoring'
+                result = None
+            else:
+                result = None
+                if not scan_lock.acquire(blocking=False):
+                    with auto_lock:
+                        auto_state['last_run'] = time.time()
+                        auto_state['last_action'] = 'scan already running — skipped this cycle'
+                    return
                 try:
-                    paper_open({'symbol': x['symbol'], 'side': x['direction'], 'entry': x['price'],
-                                'stop_loss': x['stop_loss'], 'take_profit': x['take_profit'], 'risk_pct': 2.0})
-                    action = f"AUTO PAPER {x['direction']} {x['symbol']} {x['score']}/100"
-                except ValueError as e:
-                    action = f"candidate rejected: {e}"
+                    result = scan_market('15', SCAN_CANDIDATES)
+                finally:
+                    scan_lock.release()
+                candidates = [x for x in result.get('results', [])
+                              if x.get('direction') in ('LONG', 'SHORT') and float(x.get('score', 0)) >= 70
+                              and x.get('stop_loss') and x.get('take_profit')]
+                candidates.sort(key=lambda x: float(x.get('score', 0)), reverse=True)
+                opened=[]; rejected=[]
+                for x in candidates[:4]:
+                    try:
+                        demo_open({'symbol': x['symbol'], 'side': x['direction'], 'entry': x['price'],
+                                   'stop_loss': x['stop_loss'], 'take_profit': x['take_profit'], 'risk_pct': 2.0})
+                        opened.append(f"{x['direction']} {x['symbol']} {x['score']}/100")
+                    except (ValueError, RuntimeError) as e:
+                        rejected.append(f"{x['symbol']}: {e}")
+                action = ('AUTO DEMO: ' + ', '.join(opened)) if opened else ('scan complete — no demo entry' + (f" • {rejected[0]}" if rejected else ''))
+        else:
+            paper_mark_to_market()
+            state = paper_state()
+            if state.get('risk_locked'):
+                action = 'risk lock active — no new paper entry'
+                result = None
+            elif len(state.get('open', [])) >= 4:
+                action = 'max 4 paper positions — monitoring'
+                result = None
+            else:
+                if not scan_lock.acquire(blocking=False):
+                    with auto_lock:
+                        auto_state['last_run'] = time.time()
+                        auto_state['last_action'] = 'scan already running — skipped this cycle'
+                    return
+                try:
+                    result = scan_market('15', SCAN_CANDIDATES)
+                finally:
+                    scan_lock.release()
+                candidates = [x for x in result.get('results', [])
+                              if x.get('direction') in ('LONG', 'SHORT') and float(x.get('score', 0)) >= 70
+                              and x.get('stop_loss') and x.get('take_profit')]
+                candidates.sort(key=lambda x: float(x.get('score', 0)), reverse=True)
+                opened=[]; rejected=[]
+                for x in candidates[:4]:
+                    try:
+                        paper_open({'symbol': x['symbol'], 'side': x['direction'], 'entry': x['price'],
+                                    'stop_loss': x['stop_loss'], 'take_profit': x['take_profit'], 'risk_pct': 2.0})
+                        opened.append(f"{x['direction']} {x['symbol']} {x['score']}/100")
+                    except ValueError as e:
+                        rejected.append(f"{x['symbol']}: {e}")
+                action = ('AUTO PAPER: ' + ', '.join(opened)) if opened else ('scan complete — no entry' + (f" • {rejected[0]}" if rejected else ''))
         with auto_lock:
             auto_state['last_run'] = time.time()
             auto_state['last_scan'] = result
             auto_state['last_action'] = action
             auto_state['error'] = None
+            if result is not None:
+                auto_state['last_success'] = time.time()
     except Exception as e:
         with auto_lock:
             auto_state['last_run'] = time.time()
@@ -83,7 +132,7 @@ async def _auto_loop():
 
 class ScanRequest(BaseModel):
     interval: str = Field('15', pattern=r'^(5|15|60)$')
-    limit_symbols: int = Field(24, ge=3, le=24)
+    limit_symbols: int = Field(SCAN_CANDIDATES, ge=3, le=SCAN_CANDIDATES)
 
 class PaperOpenRequest(BaseModel):
     symbol: str
@@ -91,13 +140,13 @@ class PaperOpenRequest(BaseModel):
     entry: float
     stop_loss: float
     take_profit: float
-    risk_pct: float = Field(0.5, gt=0, le=5)
+    risk_pct: float = Field(2.0, gt=0, le=5)
 
 @app.get('/')
 def index(): return FileResponse('static/index.html')
 
 @app.get('/api/health')
-def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.2.0', 'mode': 'paper-only', 'auto_scanner': auto_state['enabled']}
+def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.4.0', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
 
 @app.get('/api/auto')
 def auto_status():
@@ -122,11 +171,32 @@ def markets():
 
 @app.post('/api/scan')
 def scan(req: ScanRequest):
-    try: return scan_market(req.interval, req.limit_symbols)
-    except Exception as e: raise HTTPException(status_code=502, detail=str(e))
+    if not scan_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail='Скан уже выполняется. Подожди завершения текущего цикла.')
+    try:
+        return scan_market(req.interval, req.limit_symbols)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    finally:
+        scan_lock.release()
 
 @app.get('/api/paper')
-def paper(): return paper_state()
+def paper():
+    return demo_state() if MODE == 'demo' else paper_state()
+
+@app.get('/api/account')
+def account():
+    from engine import demo_account_state
+    return demo_account_state()
+
+@app.post('/api/trade/open')
+def trade_open(req: PaperOpenRequest):
+    try:
+        if MODE == 'demo':
+            return demo_open(req.model_dump())
+        return paper_open(req.model_dump())
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post('/api/paper/open')
 def open_paper(req: PaperOpenRequest):
@@ -134,7 +204,15 @@ def open_paper(req: PaperOpenRequest):
     except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
 
 @app.post('/api/paper/update')
-def update_paper(): return paper_mark_to_market()
+def update_paper(): return demo_state() if MODE == 'demo' else paper_mark_to_market()
 
 @app.post('/api/paper/reset')
 def reset_paper(): return paper_reset()
+
+class BudgetRequest(BaseModel):
+    amount: float = Field(gt=0)
+
+@app.post('/api/paper/budget')
+def budget(req: BudgetRequest):
+    try: return set_paper_budget(req.amount)
+    except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
