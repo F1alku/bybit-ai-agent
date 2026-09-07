@@ -53,7 +53,7 @@ def bybit_get(path, params):
     if cached is not None:
         return cached
     try:
-        with httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.0'}) as c:
+        with httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.1'}) as c:
             r = c.get(BASE + path, params=params)
             r.raise_for_status()
             j = r.json()

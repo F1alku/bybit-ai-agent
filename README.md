@@ -26,3 +26,12 @@ Start: `uvicorn app:app --host 0.0.0.0 --port $PORT`
 
 ## Important
 This is a rule-based quantitative scanner with microstructure inputs, not a trained ML model. Historical backtesting of the full microstructure layer requires archived OI/order-book/trade data; the current paper engine is the validation layer for live Testnet market data.
+
+
+## Auto Scanner 5.1
+- Автосканер включён по умолчанию в paper-only режиме.
+- Каждые 3 минуты обновляет paper-позиции, запускает Deep Scan 15M и при сигнале LONG/SHORT >= 70/100 автоматически открывает лучшую допустимую paper-сделку.
+- Максимум 2 одновременные позиции, риск 0.5%, действуют все защитные лимиты из paper engine.
+- Автосканер можно выключить/включить кнопкой в веб-интерфейсе.
+- Реальные ордера не используются.
+- Состояние paper хранится в памяти процесса и может сброситься при перезапуске Render.
