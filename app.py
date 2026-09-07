@@ -28,7 +28,7 @@ async def lifespan(_app):
         except asyncio.CancelledError:
             pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.5.0', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.6.0', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 def _auto_iteration():
@@ -146,7 +146,7 @@ class PaperOpenRequest(BaseModel):
 def index(): return FileResponse('static/index.html')
 
 @app.get('/api/health')
-def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.4.0', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
+def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.6.0', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
 
 @app.get('/api/auto')
 def auto_status():

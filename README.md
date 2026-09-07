@@ -1,68 +1,68 @@
-# Bybit AI Agent — AUTO v5.2
+# Bybit AI Agent — v5.6.0 DEMO
 
-Paper-only Bybit Testnet market scanner. No real orders.
+Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
-## Current model
-- Entire active USDT-settled linear perpetual universe is discovered dynamically from Bybit.
-- One cheap market-wide ticker pass ranks the full universe.
-- Technical pass: up to 24 liquid candidates, using 4H + 1H + setup timeframe.
-- Deep pass: top 8 candidates, adding 5M and full entry scoring.
-- Microstructure pass: top 4 candidates, adding OI, order-book imbalance, trade delta, funding and spread.
-- BTC is always included as a market-regime filter when available.
-- Expensive calls are not made for every contract.
-- Instrument metadata is cached for 10 minutes; market data uses short caching.
+## Scanner
+- Entire active USDT-settled linear perpetual universe is discovered dynamically.
+- Fast market-wide pass -> up to 24 technical candidates -> 12 deep -> 6 micro.
+- Multi-timeframe: 4H + 1H + setup timeframe + 5M microstructure.
+- OI, order-book imbalance, trade delta, funding, spread and BTC regime are included where available.
+- Entry gate currently requires LONG/SHORT and score >= 70 plus SL/TP.
+- No averaging down and no martingale.
 
-## Paper account
-- Starting balance: $10
-- Minimum leverage: 10x (paper simulation)
-- Default aggressive risk: 2% of current balance per trade
-- Maximum 2 open paper positions
-- Mandatory SL/TP
-- No averaging down
-- No martingale
-- Fees and slippage are simulated assumptions, not claims about actual Bybit fees.
+## Demo risk model
+- Bybit Demo base: `https://api-demo.bybit.com`.
+- Default Demo trading budget: **$100**.
+- Risk per trade: **2%**.
+- Leverage: **10x**.
+- Maximum simultaneous positions: **4**.
+- Daily loss limit: **$20**.
+- AUTO is **OFF by default** in Demo.
+- Orders use server-side TP/SL.
 
-## Auto scanner
-- Runs every 3 minutes on Render.
-- It can inspect the entire market without the browser being open.
-- It only opens a paper trade when the existing entry gate is confirmed and score >= 70.
-- The 70 score is a current engineering threshold, not a guarantee; it can be recalibrated from paper-trade statistics.
+## Demo account display
+The UI deliberately separates the Bybit account totals from the bot's budget:
+- USDT wallet balance
+- Bybit total equity
+- Bybit available margin
+- Bot trading budget ($100 by default)
+- Budget currently available to the bot
+- Margin reserved by open positions
+- Open/unrealized P&L
+- Realized P&L today and over the latest 7-day Bybit closed-PnL window
+- Daily P&L and daily loss limit
+
+`totalEquity` is an account-wide USD value across assets, so it must not be confused with the bot's $100 trading budget.
+
+## Demo API keys
+Set these only as Render environment variables:
+- `BYBIT_MODE=demo`
+- `BYBIT_DEMO_API_KEY`
+- `BYBIT_DEMO_API_SECRET`
+- `AUTO_ENABLED=false`
+- `DEMO_TRADING_BUDGET=100`
+- `DEMO_MAX_DAILY_LOSS=20`
+- `DEMO_RISK_PCT=2`
+
+No API secrets belong in the repository.
 
 ## API
-- GET `/`
-- GET `/api/health`
-- GET `/api/markets`
-- POST `/api/scan`
-- GET `/api/auto`
-- POST `/api/auto/toggle`
-- GET `/api/paper`
-- POST `/api/paper/open`
-- POST `/api/paper/update`
-- POST `/api/paper/reset`
+- `GET /`
+- `GET /api/health`
+- `GET /api/markets`
+- `POST /api/scan`
+- `GET /api/auto`
+- `POST /api/auto/toggle`
+- `GET /api/paper`
+- `GET /api/account`
+- `POST /api/trade/open`
+- `POST /api/paper/update`
+- `POST /api/paper/reset`
+- `POST /api/paper/budget`
 
-## Run
-```bash
-pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port $PORT
-```
-
-
-## v5.4 changes
-- Full active USDT-settled linear perpetual universe -> 24 technical -> 12 deep -> 6 micro.
-- Up to 4 simultaneous paper positions when independent signals qualify.
-- Dynamic margin allocation: if ideal position does not fit the trading budget, quantity is reduced to available margin instead of immediately rejecting the signal.
-- Trading budget / reserved margin / available margin are exposed in paper state.
-- Default paper budget remains $10; it can be changed through `/api/paper/budget` up to current balance.
-- Demo-ready API layer uses `https://api-demo.bybit.com` when `BYBIT_MODE=demo`; API keys are read only from environment variables. No keys are stored in the repository.
-- `/api/account` reports Demo wallet status when Demo mode is configured.
-- Real Demo order execution is intentionally not enabled by default; PAPER remains the safe default.
-
-
-## Demo mode
-- `BYBIT_MODE=demo` uses Bybit Demo Trading at `https://api-demo.bybit.com`.
-- Set `BYBIT_DEMO_API_KEY` and `BYBIT_DEMO_API_SECRET` only as Render environment secrets; never commit them.
-- `AUTO_ENABLED=false` by default in Demo. Enable AUTO only after `/api/account` shows `configured=true`.
-- Demo trading budget defaults to $100, daily loss limit $20, risk 2%, leverage 10x, max 4 positions.
-- Demo orders are real orders inside Bybit Demo, with server-side TP/SL.
-- Public market data remains from Bybit mainnet public streams/endpoints as specified by Bybit Demo documentation.
-- Demo API keys are separate from Testnet keys.
+## Safety sequence
+1. Deploy with Demo mode and AUTO OFF.
+2. Verify the account page and the separated $100 bot budget.
+3. Run a controlled manual Demo trade with valid SL/TP.
+4. Confirm position, uPnL and closed-PnL reporting.
+5. Only then consider enabling AUTO.

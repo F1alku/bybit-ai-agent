@@ -44,7 +44,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.3'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.6'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -587,6 +587,35 @@ def _demo_positions():
     return bybit_private_get('/v5/position/list', {'category':'linear','settleCoin':'USDT'}).get('list', [])
 
 
+def _demo_closed_pnl(limit=100):
+    return bybit_private_get('/v5/position/closed-pnl', {'category':'linear','limit':min(int(limit), 100)}).get('list', [])
+
+
+def _demo_pnl_snapshot(wallet, positions, closed):
+    acct = (wallet.get('list') or [{}])[0]
+    now_ms = int(time.time() * 1000)
+    day_start_ms = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    realized_7d = sum(float(x.get('closedPnl') or 0) for x in closed)
+    realized_today = sum(float(x.get('closedPnl') or 0) for x in closed if int(x.get('updatedTime') or x.get('createdTime') or 0) >= day_start_ms)
+    unrealized = sum(float(x.get('unrealisedPnl') or 0) for x in positions)
+    # This is the account's current perp P&L view; it is intentionally separate from the bot's $100 budget.
+    account_unrealized = float(acct.get('totalPerpUPL') or unrealized or 0)
+    total_pnl_7d = realized_7d + account_unrealized
+    daily_pnl = realized_today + account_unrealized
+    reserved_margin = sum(abs(float(x.get('positionIM') or 0)) for x in positions)
+    return {
+        'realized_pnl_7d': round(realized_7d, 6),
+        'realized_pnl_today': round(realized_today, 6),
+        'unrealized_pnl': round(account_unrealized, 6),
+        'total_pnl_7d': round(total_pnl_7d, 6),
+        'daily_pnl': round(daily_pnl, 6),
+        'daily_loss': round(max(0.0, -daily_pnl), 6),
+        'reserved_margin': round(reserved_margin, 6),
+        'day_start_ms': day_start_ms,
+        'now_ms': now_ms,
+    }
+
+
 def _demo_available_usdt():
     result = _demo_wallet()
     lst = result.get('list', [])
@@ -623,12 +652,14 @@ def _demo_risk_qty(symbol, entry, sl):
 
 
 
-def _demo_guard_status(equity):
-    today = datetime.now(timezone.utc).date().isoformat()
-    if _demo_guard['day'] != today or _demo_guard['start_equity'] is None:
-        _demo_guard['day'] = today
-        _demo_guard['start_equity'] = equity
-    loss = max(0.0, _demo_guard['start_equity'] - equity)
+def _demo_guard_status(equity=None):
+    # Use Bybit's actual closed PnL + current perp uPnL so the daily guard survives
+    # Render restarts instead of depending on an in-memory start-equity snapshot.
+    wallet = _demo_wallet()
+    positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
+    closed = _demo_closed_pnl(100)
+    snap = _demo_pnl_snapshot(wallet, positions, closed)
+    loss = snap['daily_loss']
     return loss, loss >= DEMO_MAX_DAILY_LOSS
 
 def demo_open(d):
@@ -659,9 +690,26 @@ def demo_state():
     try:
         wallet = _demo_wallet()
         positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
-        acct=(wallet.get('list') or [{}])[0]; equity=float(acct.get('totalEquity') or 0)
-        daily_loss, locked = _demo_guard_status(equity)
-        return {'mode':'demo','configured':True,'wallet':wallet,'positions':positions,'max_positions':MAX_POSITIONS,'trading_budget':DEMO_TRADING_BUDGET,'daily_loss_limit':DEMO_MAX_DAILY_LOSS,'daily_loss':daily_loss,'risk_pct':DEMO_RISK_PCT,'leverage':LEVERAGE,'risk_locked':locked}
+        closed = _demo_closed_pnl(100)
+        acct = (wallet.get('list') or [{}])[0]
+        coin = next((x for x in acct.get('coin', []) if x.get('coin') == 'USDT'), {})
+        equity = float(acct.get('totalEquity') or 0)
+        usdt_wallet = float(coin.get('walletBalance') or 0)
+        available_margin = float(acct.get('totalAvailableBalance') or 0)
+        snap = _demo_pnl_snapshot(wallet, positions, closed)
+        daily_loss = snap['daily_loss']
+        locked = daily_loss >= DEMO_MAX_DAILY_LOSS
+        budget = max(0.0, DEMO_TRADING_BUDGET)
+        bot_available = max(0.0, min(budget - snap['reserved_margin'], available_margin))
+        return {
+            'mode':'demo','configured':True,'wallet':wallet,'positions':positions,'closed_pnl':closed[:20],
+            'max_positions':MAX_POSITIONS,'trading_budget':budget,'bot_available_budget':round(bot_available, 6),
+            'reserved_margin':snap['reserved_margin'],'daily_loss_limit':DEMO_MAX_DAILY_LOSS,'daily_loss':daily_loss,
+            'daily_pnl':snap['daily_pnl'],'realized_pnl_today':snap['realized_pnl_today'],
+            'realized_pnl_7d':snap['realized_pnl_7d'],'unrealized_pnl':snap['unrealized_pnl'],
+            'total_pnl_7d':snap['total_pnl_7d'],'equity':equity,'usdt_wallet_balance':usdt_wallet,
+            'available_margin':available_margin,'risk_pct':DEMO_RISK_PCT,'leverage':LEVERAGE,'risk_locked':locked,
+        }
     except Exception as e:
         return {'mode':'demo','configured':True,'error':str(e)}
 
