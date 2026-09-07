@@ -18,7 +18,7 @@ def test_score_schema():
 
 def test_paper_long_validation_and_fee():
     engine.paper_reset(); s=engine.paper_open({'symbol':'BTCUSDT','side':'LONG','entry':100,'stop_loss':99,'take_profit':102,'risk_pct':0.5})
-    assert len(s['open'])==1 and s['balance'] < 1000 and s['open'][0]['entry_fee'] > 0; engine.paper_reset()
+    assert len(s['open'])==1 and s['balance'] < 10 and s['open'][0]['entry_fee'] > 0; engine.paper_reset()
 
 def test_api_all_routes(monkeypatch):
     monkeypatch.setattr(app, 'market_snapshot', lambda n=20:[{'symbol':'BTCUSDT','lastPrice':100.0,'turnover24h':1000.0,'price24hPcnt':1.0,'highPrice24h':101.0,'lowPrice24h':99.0,'volume24h':10.0}])
@@ -42,7 +42,7 @@ def test_flow_features_mock_and_oi_sign(monkeypatch):
     assert x['oi_change_pct']>0 and x['orderbook_imbalance']>0 and x['trade_delta_pct']>0 and x['funding_rate']>0
 
 def test_daily_risk_lock():
-    engine.paper_reset(); engine._state['day_start_balance']=1000.0; engine._state['balance']=979.0
+    engine.paper_reset(); engine._state['day_start_balance']=10.0; engine._state['balance']=7.9
     try: engine.paper_open({'symbol':'BTCUSDT','side':'LONG','entry':100,'stop_loss':99,'take_profit':102,'risk_pct':0.5}); assert False
     except ValueError as e: assert 'daily loss limit' in str(e)
     engine.paper_reset()
