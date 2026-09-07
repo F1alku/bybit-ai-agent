@@ -215,7 +215,18 @@ def scan_status(job_id: str):
         raise HTTPException(status_code=502, detail=job.get('error', 'scan failed'))
     if job['status'] == 'running':
         return {'ok': True, 'job_id': job_id, 'status': 'running'}
-    return {'ok': True, 'job_id': job_id, 'status': 'done', **job['result']}
+    
+    result = job.get('result') or {}
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=502, detail='Скан вернул некорректный результат.')
+    # Keep a stable response contract for the browser even if a future engine version omits a field.
+    result.setdefault('failures', [])
+    result.setdefault('results', [])
+    result.setdefault('universe_size', 0)
+    result.setdefault('technical_checked', 0)
+    result.setdefault('deep_checked', 0)
+    result.setdefault('micro_checked', 0)
+    return {'ok': True, 'job_id': job_id, 'status': 'done', **result}
 
 @app.get('/api/paper')
 def paper():
