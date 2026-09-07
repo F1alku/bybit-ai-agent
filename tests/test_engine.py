@@ -107,3 +107,23 @@ def test_demo_state_uses_last_good_state_on_wallet_failure(monkeypatch):
     monkeypatch.setattr(engine, '_demo_wallet', lambda: (_ for _ in ()).throw(RuntimeError('wallet timeout')))
     second = engine.demo_state()
     assert second['stale'] is True and second['equity'] == first['equity'] and second['usdt_wallet_balance'] == first['usdt_wallet_balance']
+
+
+def test_json_safe_handles_nonfinite_numpy(monkeypatch):
+    import numpy as np
+    x=engine._json_safe({'a': np.float64(1.25), 'b': float('nan'), 'c': [np.float64(2.0)]})
+    assert x == {'a':1.25,'b':None,'c':[2.0]}
+
+def test_scan_error_is_json_contract(monkeypatch):
+    monkeypatch.setattr(app, 'scan_market', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    c=TestClient(app.app)
+    r=c.post('/api/scan', json={'interval':'15','limit_symbols':24})
+    assert r.status_code==200 and r.json()['status']=='running'
+    import time
+    for _ in range(30):
+        rr=c.get('/api/scan/'+r.json()['job_id'])
+        if rr.json().get('status')=='error':
+            assert rr.status_code==200 and rr.json()['error']=='boom'
+            return
+        time.sleep(0.02)
+    assert False, 'scan job did not finish'
