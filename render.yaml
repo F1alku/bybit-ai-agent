@@ -9,7 +9,33 @@ services:
         value: 3.13.5
       - key: BYBIT_MODE
         value: demo
+      - key: LIVE_TRADING_ARMED
+        value: 'false'
+      - key: AUTO_ENABLED
+        value: 'false'
+      - key: RUN_TRADER_IN_WEB
+        value: 'false'
+      - key: DEMO_TRADING_BUDGET
+        value: '100'
+      - key: DEMO_MAX_DAILY_LOSS
+        value: '20'
+      - key: DEMO_RISK_PCT
+        value: '2'
+      - key: DATABASE_URL
+        sync: false
 
+  - type: worker
+    name: bybit-ai-agent-worker
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: BYBIT_MODE
+        value: demo
+      - key: LIVE_TRADING_ARMED
+        value: 'false'
       - key: AUTO_ENABLED
         value: 'false'
       - key: DEMO_TRADING_BUDGET
@@ -18,3 +44,5 @@ services:
         value: '20'
       - key: DEMO_RISK_PCT
         value: '2'
+      - key: DATABASE_URL
+        sync: false

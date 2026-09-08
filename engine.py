@@ -14,9 +14,14 @@ import hmac
 import json
 
 MODE = os.getenv('BYBIT_MODE', 'paper').lower()
-BASE = 'https://api-demo.bybit.com' if MODE == 'demo' else 'https://api-testnet.bybit.com'
+if MODE not in ('paper', 'demo', 'live'):
+    MODE = 'paper'
+BASE = {'demo':'https://api-demo.bybit.com', 'live':'https://api.bybit.com', 'paper':'https://api-testnet.bybit.com'}[MODE]
 DEMO_API_KEY = os.getenv('BYBIT_DEMO_API_KEY', '')
 DEMO_API_SECRET = os.getenv('BYBIT_DEMO_API_SECRET', '')
+LIVE_API_KEY = os.getenv('BYBIT_LIVE_API_KEY', '')
+LIVE_API_SECRET = os.getenv('BYBIT_LIVE_API_SECRET', '')
+LIVE_TRADING_ARMED = os.getenv('LIVE_TRADING_ARMED', 'false').lower() == 'true'
 TIMEOUT = 10.0
 CACHE_TTL = 20.0
 RETRY_COUNT = 2
@@ -30,6 +35,9 @@ START_BALANCE = 10.0
 DEMO_TRADING_BUDGET = float(os.getenv('DEMO_TRADING_BUDGET', '100'))
 DEMO_MAX_DAILY_LOSS = float(os.getenv('DEMO_MAX_DAILY_LOSS', '20'))
 DEMO_RISK_PCT = float(os.getenv('DEMO_RISK_PCT', '2'))
+LIVE_TRADING_BUDGET = float(os.getenv('LIVE_TRADING_BUDGET', '100'))
+LIVE_MAX_DAILY_LOSS = float(os.getenv('LIVE_MAX_DAILY_LOSS', '20'))
+LIVE_RISK_PCT = float(os.getenv('LIVE_RISK_PCT', '2'))
 
 # Scan budget: broad market discovery is one ticker request; expensive candle/microstructure
 # calls are reserved for a small ranked subset.
@@ -47,7 +55,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.6.6'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.7.0'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -80,13 +88,19 @@ def _put_cache(key, value):
 
 
 def _auth_headers(method, path, payload):
-    if MODE != 'demo' or not DEMO_API_KEY or not DEMO_API_SECRET:
+    if MODE == 'demo':
+        key, secret = DEMO_API_KEY, DEMO_API_SECRET
+    elif MODE == 'live':
+        key, secret = LIVE_API_KEY, LIVE_API_SECRET
+    else:
+        return {}
+    if not key or not secret:
         return {}
     ts = str(int(time.time() * 1000)); recv = '5000'
     from urllib.parse import urlencode
     body = urlencode(sorted(payload.items())) if method == 'GET' else json.dumps(payload, separators=(',', ':'))
-    sign = hmac.new(DEMO_API_SECRET.encode(), (ts + DEMO_API_KEY + recv + body).encode(), hashlib.sha256).hexdigest()
-    return {'X-BAPI-API-KEY': DEMO_API_KEY, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': recv, 'X-BAPI-SIGN': sign}
+    sign = hmac.new(secret.encode(), (ts + key + recv + body).encode(), hashlib.sha256).hexdigest()
+    return {'X-BAPI-API-KEY': key, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': recv, 'X-BAPI-SIGN': sign}
 
 def bybit_get(path, params):
     key = (MODE, path, tuple(sorted((str(k), str(v)) for k, v in params.items())))
@@ -117,8 +131,14 @@ def bybit_get(path, params):
     raise last_error or RuntimeError('Bybit request failed')
 
 def bybit_private_post(path, body):
-    if MODE != 'demo': raise RuntimeError('Private Bybit API is disabled in paper mode')
-    if not DEMO_API_KEY or not DEMO_API_SECRET: raise RuntimeError('Demo API key/secret are not configured')
+    if MODE == 'demo':
+        key, secret = DEMO_API_KEY, DEMO_API_SECRET
+    elif MODE == 'live':
+        if not LIVE_TRADING_ARMED: raise RuntimeError('LIVE trading is not armed')
+        key, secret = LIVE_API_KEY, LIVE_API_SECRET
+    else:
+        raise RuntimeError('Private Bybit API is disabled in paper mode')
+    if not key or not secret: raise RuntimeError(f'{MODE.upper()} API key/secret are not configured')
     # Never blindly retry order creation: a network timeout can happen after Bybit accepted
     # the order, and a retry could create a duplicate. Non-order control endpoints are safe
     # to retry on transient transport/server failures.
@@ -646,8 +666,13 @@ def _private_put(key, value):
     return value
 
 def bybit_private_get(path, params, retries=PRIVATE_RETRY_COUNT):
-    if MODE != 'demo': raise RuntimeError('Private Bybit API is disabled in paper mode')
-    if not DEMO_API_KEY or not DEMO_API_SECRET: raise RuntimeError('Demo API key/secret are not configured')
+    if MODE == 'demo':
+        key, secret = DEMO_API_KEY, DEMO_API_SECRET
+    elif MODE == 'live':
+        key, secret = LIVE_API_KEY, LIVE_API_SECRET
+    else:
+        raise RuntimeError('Private Bybit API is disabled in paper mode')
+    if not key or not secret: raise RuntimeError(f'{MODE.upper()} API key/secret are not configured')
     last_error = None
     for attempt in range(retries + 1):
         try:
@@ -739,8 +764,10 @@ def _demo_available_usdt():
 
 def _demo_risk_qty(symbol, entry, sl):
     available, equity, _ = _demo_available_usdt()
-    budget = min(DEMO_TRADING_BUDGET, available)
-    risk_cash = min(equity, budget) * DEMO_RISK_PCT / 100
+    budget_limit = DEMO_TRADING_BUDGET if MODE == 'demo' else LIVE_TRADING_BUDGET
+    risk_pct = DEMO_RISK_PCT if MODE == 'demo' else LIVE_RISK_PCT
+    budget = min(budget_limit, available)
+    risk_cash = min(equity, budget) * risk_pct / 100
     dist = abs(entry - sl)
     if dist <= 0: raise ValueError('invalid stop distance')
     qty = risk_cash / dist
@@ -768,7 +795,8 @@ def _demo_guard_status(equity=None):
     return loss, loss >= DEMO_MAX_DAILY_LOSS
 
 def demo_open(d):
-    if MODE != 'demo': raise ValueError('Demo mode is not enabled')
+    if MODE not in ('demo', 'live'): raise ValueError('Exchange trading mode is not enabled')
+    if MODE == 'live' and not LIVE_TRADING_ARMED: raise ValueError('LIVE trading is not armed')
     side = str(d['side']).upper(); symbol = str(d['symbol']).upper(); entry = float(d['entry']); sl = float(d['stop_loss']); tp = float(d['take_profit'])
     if side not in ('LONG','SHORT'): raise ValueError('side must be LONG or SHORT')
     if entry <= 0 or sl <= 0 or tp <= 0: raise ValueError('entry, stop_loss and take_profit must be positive')
@@ -776,10 +804,11 @@ def demo_open(d):
     if side == 'SHORT' and not (tp < entry < sl): raise ValueError('SHORT requires take_profit < entry < stop_loss')
     positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
     if len(positions) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} demo positions')
-    if any(x.get('symbol') == symbol for x in positions): raise ValueError('Demo position for this symbol already open')
+    if any(x.get('symbol') == symbol for x in positions): raise ValueError('Position for this symbol already open')
     qty, margin, available, equity = _demo_risk_qty(symbol, entry, sl)
     daily_loss, locked = _demo_guard_status(equity)
-    if locked: raise ValueError(f'Demo daily loss limit reached: ${daily_loss:.2f} / ${DEMO_MAX_DAILY_LOSS:.2f}')
+    limit = DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
+    if locked: raise ValueError(f'Daily loss limit reached: ${daily_loss:.2f} / ${limit:.2f}')
     # Set leverage first. If account is already at the desired leverage, Bybit returns success.
     bybit_private_post('/v5/position/set-leverage', {'category':'linear','symbol':symbol,'buyLeverage':str(int(LEVERAGE)),'sellLeverage':str(int(LEVERAGE))})
     order = {
@@ -789,14 +818,36 @@ def demo_open(d):
     }
     result = bybit_private_post('/v5/order/create', order)
     _invalidate_demo_account_cache()
-    return {'mode':'demo','ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'order':result}
+    return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'order':result}
 
+
+def exchange_positions():
+    return [x for x in bybit_private_get('/v5/position/list', {'category':'linear','settleCoin':'USDT'}).get('list', []) if float(x.get('size') or 0) > 0]
+
+def close_position(symbol):
+    if MODE not in ('demo','live'):
+        raise ValueError('Exchange position closing is unavailable in paper mode')
+    symbol = str(symbol).upper()
+    positions = [x for x in exchange_positions() if x.get('symbol') == symbol]
+    if not positions:
+        raise ValueError(f'No open position for {symbol}')
+    p = positions[0]
+    qty = p.get('size')
+    side = 'Sell' if p.get('side') == 'Buy' else 'Buy'
+    result = bybit_private_post('/v5/order/create', {
+        'category':'linear','symbol':symbol,'side':side,'orderType':'Market','qty':str(qty),
+        'positionIdx':int(p.get('positionIdx') or 0),'reduceOnly':True,'closeOnTrigger':True,
+        'orderLinkId':f'ai-close-{int(time.time()*1000)}'
+    })
+    _invalidate_demo_account_cache()
+    return {'mode':MODE,'ok':True,'symbol':symbol,'closed_qty':qty,'order':result}
 
 def demo_state():
     global _demo_last_good_state
-    if MODE != 'demo': return {'mode':'paper','configured':False}
-    if not DEMO_API_KEY or not DEMO_API_SECRET:
-        return {'mode':'demo','configured':False,'error':'BYBIT_DEMO_API_KEY / BYBIT_DEMO_API_SECRET missing'}
+    if MODE not in ('demo','live'): return {'mode':'paper','configured':False}
+    api_key, api_secret = (DEMO_API_KEY, DEMO_API_SECRET) if MODE == 'demo' else (LIVE_API_KEY, LIVE_API_SECRET)
+    if not api_key or not api_secret:
+        return {'mode':MODE,'configured':False,'error':f'{MODE.upper()} API key/secret missing'}
     warnings = []
     try:
         wallet = _demo_wallet()
@@ -828,14 +879,14 @@ def demo_state():
     available_margin = float(acct.get('totalAvailableBalance') or 0)
     snap = _demo_pnl_snapshot(wallet, positions, closed)
     daily_loss = snap['daily_loss']
-    locked = daily_loss >= DEMO_MAX_DAILY_LOSS
-    budget = max(0.0, DEMO_TRADING_BUDGET)
+    locked = daily_loss >= (DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS)
+    budget = max(0.0, DEMO_TRADING_BUDGET if MODE == 'demo' else LIVE_TRADING_BUDGET)
     bot_available = max(0.0, min(budget - snap['reserved_margin'], available_margin))
     state = {
         'mode':'demo','configured':True,'degraded':bool(warnings),'stale':False,'warnings':warnings,
         'wallet':wallet,'positions':positions,'closed_pnl':closed[:20],
         'max_positions':MAX_POSITIONS,'trading_budget':budget,'bot_available_budget':round(bot_available, 6),
-        'reserved_margin':snap['reserved_margin'],'daily_loss_limit':DEMO_MAX_DAILY_LOSS,'daily_loss':daily_loss,
+        'reserved_margin':snap['reserved_margin'],'daily_loss_limit':(DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS),'daily_loss':daily_loss,
         'daily_pnl':snap['daily_pnl'],'realized_pnl_today':snap['realized_pnl_today'],
         'realized_pnl_7d':snap['realized_pnl_7d'],'unrealized_pnl':snap['unrealized_pnl'],
         'total_pnl_7d':snap['total_pnl_7d'],'equity':equity,'usdt_wallet_balance':usdt_wallet,

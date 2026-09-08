@@ -1,4 +1,4 @@
-# Bybit AI Agent — v5.6.6 DEMO
+# Bybit AI Agent — v5.7.1 DEMO
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -66,3 +66,22 @@ No API secrets belong in the repository.
 3. Run a controlled manual Demo trade with valid SL/TP.
 4. Confirm position, uPnL and closed-PnL reporting.
 5. Only then consider enabling AUTO.
+
+
+## Production-ready modes
+- `BYBIT_MODE=paper`: no exchange trading.
+- `BYBIT_MODE=demo`: Bybit Demo Trading.
+- `BYBIT_MODE=live`: Bybit mainnet API, but order placement is blocked unless `LIVE_TRADING_ARMED=true`.
+- Live credentials use `BYBIT_LIVE_API_KEY` / `BYBIT_LIVE_API_SECRET`; Demo credentials remain separate.
+- Manual Market close: `POST /api/trade/close` with `{"symbol":"BTCUSDT"}`.
+- Live mode should be enabled only after Demo validation and an explicit production checklist.
+
+## Persistent trading process and journal — v5.7.1
+- Trading execution is separated from the web UI into `worker.py` / Render Background Worker.
+- The web service can run with `RUN_TRADER_IN_WEB=false`, preventing duplicate trading loops.
+- The worker is intended to remain running continuously; do not rely on a Free web service for 24/7 trading because Render Free web services spin down after 15 minutes without inbound traffic. See Render docs.
+- `journal.py` stores authoritative Bybit Closed PnL records in Postgres when `DATABASE_URL` is configured. It falls back to SQLite for local testing.
+- On startup the worker synchronizes recent Bybit Closed PnL before starting AUTO.
+- `/api/journal` exposes the synchronized trade history to the UI.
+- For production, use a Render Postgres database (or another durable external database). Do not rely on local SQLite on Render Free because its filesystem is ephemeral.
+- Production topology: Web Service (UI/API) + Background Worker (AUTO trader) + durable Postgres database.

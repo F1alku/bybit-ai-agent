@@ -10,7 +10,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open
+from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position
+from journal import init_db, recent as journal_recent, sync_closed_pnl
+from trader import run_auto_cycle
 
 AUTO_INTERVAL_SEC = 180
 SCAN_CANDIDATES = 24
@@ -19,21 +21,23 @@ scan_lock = threading.Lock()
 scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
-auto_state = {'enabled': os.getenv('AUTO_ENABLED','false' if MODE=='demo' else 'true').lower() == 'true', 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0}
+auto_state = {'enabled': os.getenv('AUTO_ENABLED','false').lower() == 'true', 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0}
 
 @asynccontextmanager
 async def lifespan(_app):
-    task = asyncio.create_task(_auto_loop())
+    init_db()
+    task = asyncio.create_task(_auto_loop()) if os.getenv('RUN_TRADER_IN_WEB','true').lower() == 'true' else None
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.6.6', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.7.1', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -56,73 +60,7 @@ def _auto_iteration():
         if not auto_state['enabled']:
             return
     try:
-        if MODE == 'demo':
-            state = demo_state()
-            if not state.get('configured'):
-                action = 'Demo API not configured'
-                result = None
-            elif state.get('error'):
-                action = 'Demo sync error'
-                result = None
-            elif len(state.get('positions', [])) >= 4:
-                action = 'max 4 demo positions — monitoring'
-                result = None
-            else:
-                result = None
-                if not scan_lock.acquire(blocking=False):
-                    with auto_lock:
-                        auto_state['last_run'] = time.time()
-                        auto_state['last_action'] = 'scan already running — skipped this cycle'
-                    return
-                try:
-                    result = scan_market('15', SCAN_CANDIDATES)
-                finally:
-                    scan_lock.release()
-                candidates = [x for x in result.get('results', [])
-                              if x.get('direction') in ('LONG', 'SHORT') and float(x.get('score', 0)) >= 70
-                              and x.get('stop_loss') and x.get('take_profit')]
-                candidates.sort(key=lambda x: float(x.get('score', 0)), reverse=True)
-                opened=[]; rejected=[]
-                for x in candidates[:4]:
-                    try:
-                        demo_open({'symbol': x['symbol'], 'side': x['direction'], 'entry': x['price'],
-                                   'stop_loss': x['stop_loss'], 'take_profit': x['take_profit'], 'risk_pct': 2.0})
-                        opened.append(f"{x['direction']} {x['symbol']} {x['score']}/100")
-                    except (ValueError, RuntimeError) as e:
-                        rejected.append(f"{x['symbol']}: {e}")
-                action = ('AUTO DEMO: ' + ', '.join(opened)) if opened else ('scan complete — no demo entry' + (f" • {rejected[0]}" if rejected else ''))
-        else:
-            paper_mark_to_market()
-            state = paper_state()
-            if state.get('risk_locked'):
-                action = 'risk lock active — no new paper entry'
-                result = None
-            elif len(state.get('open', [])) >= 4:
-                action = 'max 4 paper positions — monitoring'
-                result = None
-            else:
-                if not scan_lock.acquire(blocking=False):
-                    with auto_lock:
-                        auto_state['last_run'] = time.time()
-                        auto_state['last_action'] = 'scan already running — skipped this cycle'
-                    return
-                try:
-                    result = scan_market('15', SCAN_CANDIDATES)
-                finally:
-                    scan_lock.release()
-                candidates = [x for x in result.get('results', [])
-                              if x.get('direction') in ('LONG', 'SHORT') and float(x.get('score', 0)) >= 70
-                              and x.get('stop_loss') and x.get('take_profit')]
-                candidates.sort(key=lambda x: float(x.get('score', 0)), reverse=True)
-                opened=[]; rejected=[]
-                for x in candidates[:4]:
-                    try:
-                        paper_open({'symbol': x['symbol'], 'side': x['direction'], 'entry': x['price'],
-                                    'stop_loss': x['stop_loss'], 'take_profit': x['take_profit'], 'risk_pct': 2.0})
-                        opened.append(f"{x['direction']} {x['symbol']} {x['score']}/100")
-                    except ValueError as e:
-                        rejected.append(f"{x['symbol']}: {e}")
-                action = ('AUTO PAPER: ' + ', '.join(opened)) if opened else ('scan complete — no entry' + (f" • {rejected[0]}" if rejected else ''))
+        result, action, _ = run_auto_cycle()
         with auto_lock:
             auto_state['last_run'] = time.time()
             auto_state['last_scan'] = result
@@ -166,7 +104,9 @@ class PaperOpenRequest(BaseModel):
 def index(): return FileResponse('static/index.html')
 
 @app.get('/api/health')
-def health(): return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.6.6', 'mode': ('demo' if __import__('engine').MODE == 'demo' else 'paper-only'), 'auto_scanner': auto_state['enabled']}
+def health():
+    import engine
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.7.1', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled']}
 
 @app.get('/api/auto')
 def auto_status():
@@ -257,12 +197,30 @@ def account():
     from engine import demo_account_state
     return demo_account_state()
 
+@app.get('/api/journal')
+def journal():
+    try:
+        if MODE in ('demo','live'):
+            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
+        return {'ok': True, 'mode': MODE, 'trades': journal_recent(100)}
+    except Exception as e:
+        return {'ok': False, 'mode': MODE, 'trades': [], 'error': str(e)}
+
 @app.post('/api/trade/open')
 def trade_open(req: PaperOpenRequest):
     try:
         if MODE == 'demo':
             return demo_open(req.model_dump())
         return paper_open(req.model_dump())
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post('/api/trade/close')
+def trade_close(req: dict):
+    try:
+        if MODE in ('demo','live'):
+            return close_position(req.get('symbol'))
+        raise ValueError('Exchange position closing is unavailable in paper mode')
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
