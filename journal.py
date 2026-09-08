@@ -2,7 +2,7 @@ import os, sqlite3, threading, time
 from contextlib import contextmanager
 
 DATABASE_URL = os.getenv('DATABASE_URL', '').strip()
-SQLITE_PATH = os.getenv('JOURNAL_DB_PATH', '/var/data/bybit_agent.db')
+SQLITE_PATH = os.getenv('JOURNAL_DB_PATH', '/tmp/bybit_agent.db')
 _lock = threading.RLock()
 
 

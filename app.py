@@ -37,7 +37,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.7.1', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.7.2', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')

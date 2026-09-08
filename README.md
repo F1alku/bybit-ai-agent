@@ -1,4 +1,4 @@
-# Bybit AI Agent — v5.7.1 DEMO
+# Bybit AI Agent — v5.7.2 DEMO
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -76,7 +76,7 @@ No API secrets belong in the repository.
 - Manual Market close: `POST /api/trade/close` with `{"symbol":"BTCUSDT"}`.
 - Live mode should be enabled only after Demo validation and an explicit production checklist.
 
-## Persistent trading process and journal — v5.7.1
+## Persistent trading process and journal — v5.7.2
 - Trading execution is separated from the web UI into `worker.py` / Render Background Worker.
 - The web service can run with `RUN_TRADER_IN_WEB=false`, preventing duplicate trading loops.
 - The worker is intended to remain running continuously; do not rely on a Free web service for 24/7 trading because Render Free web services spin down after 15 minutes without inbound traffic. See Render docs.
@@ -85,3 +85,6 @@ No API secrets belong in the repository.
 - `/api/journal` exposes the synchronized trade history to the UI.
 - For production, use a Render Postgres database (or another durable external database). Do not rely on local SQLite on Render Free because its filesystem is ephemeral.
 - Production topology: Web Service (UI/API) + Background Worker (AUTO trader) + durable Postgres database.
+
+## Render database requirement
+For persistent trade history, set DATABASE_URL to a Render Postgres database. If DATABASE_URL is absent, the app uses /tmp/bybit_agent.db only as a non-persistent fallback so the web service can still start; it is not suitable for production history.
