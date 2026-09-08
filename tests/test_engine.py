@@ -127,3 +127,17 @@ def test_scan_error_is_json_contract(monkeypatch):
             return
         time.sleep(0.02)
     assert False, 'scan job did not finish'
+
+
+def test_score_entry_threshold_and_blockers():
+    f={k:candles() for k in ['5','15','60','240','D']}
+    x=engine.score(f,'15',entry_threshold=60,strategy='normal')
+    assert x['entry_threshold']==60 and 'blockers' in x and 'market_regime' in x
+    assert x['decision'] in {'WAIT','OPEN LONG','OPEN SHORT'}
+
+
+def test_strategy_gate_persists(monkeypatch, tmp_path):
+    import journal
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'j.db'))
+    journal.set_setting('scalp_gate', 55)
+    assert journal.get_setting('scalp_gate') == '55'
