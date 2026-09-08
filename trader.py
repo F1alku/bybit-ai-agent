@@ -4,21 +4,24 @@ from engine import MODE, MAX_POSITIONS, scan_market, demo_state, demo_open, pape
 STRATEGY_DEFAULT = os.getenv('STRATEGY_MODE','normal').lower() if os.getenv('STRATEGY_MODE','normal').lower() in ('normal','scalp') else 'normal'
 
 def _strategy_config():
-    # NORMAL keeps the current multi-timeframe setup. SCALP uses a faster 5M setup
-    # and a stricter score gate; exit management remains under the same risk engine.
+    # Read strategy mode from the web app when available and gates from the
+    # persistent settings store. Keep independent fallbacks so one failure
+    # cannot leave a gate variable uninitialised (the v5.8.1 bug).
     mode = STRATEGY_DEFAULT
     try:
         from app import strategy_state
         mode = strategy_state.get('mode', mode)
     except Exception:
         pass
-    
+
+    try:
         from journal import get_setting
-        normal_gate = int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70')))
-        scalp_gate = int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))
+        normal_gate = int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE', '70')))
+        scalp_gate = int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE', '60')))
     except Exception:
-        normal_gate = int(os.getenv('NORMAL_SCORE_GATE','70'))
-        scalp_gate = int(os.getenv('SCALP_SCORE_GATE','60'))
+        normal_gate = int(os.getenv('NORMAL_SCORE_GATE', '70'))
+        scalp_gate = int(os.getenv('SCALP_SCORE_GATE', '60'))
+
     return mode, ('5' if mode == 'scalp' else '15'), (scalp_gate if mode == 'scalp' else normal_gate)
 
 

@@ -90,6 +90,6 @@ No API secrets belong in the repository.
 For persistent trade history, set DATABASE_URL to a Render Postgres database. If DATABASE_URL is absent, the app uses /tmp/bybit_agent.db only as a non-persistent fallback so the web service can still start; it is not suitable for production history.
 
 
-## v5.8.1
+## v5.8.2
 
 Entry gate relaxed: 4H/1H opposite trend, structure confirmation, spread/volatility, BTC regime, R:R/net edge and configured score remain hard blockers. VWAP, momentum, delta, OI and premium/discount are score evidence rather than mandatory binary gates.
