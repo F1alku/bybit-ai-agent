@@ -141,3 +141,13 @@ def test_strategy_gate_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'j.db'))
     journal.set_setting('scalp_gate', 55)
     assert journal.get_setting('scalp_gate') == '55'
+
+def test_strategy_config_scales_gate_without_unbound_local(monkeypatch, tmp_path):
+    import journal, trader
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'j.db'))
+    journal.set_setting('scalp_gate', 55)
+    journal.set_setting('normal_gate', 70)
+    import app
+    monkeypatch.setitem(app.strategy_state, 'mode', 'scalp')
+    mode, interval, gate = trader._strategy_config()
+    assert (mode, interval, gate) == ('scalp', '5', 55)
