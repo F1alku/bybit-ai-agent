@@ -49,13 +49,15 @@ DAILY_LOSS_LIMIT_PCT = 6.0
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_COOLDOWN_SEC = 30 * 60
 ENTRY_SCORE_MIN = 70
+ENTRY_RR_MIN = float(os.getenv('ENTRY_RR_MIN', '1.5'))
+SCALP_TIME_STOP_MIN = int(os.getenv('SCALP_TIME_STOP_MIN', '15'))
 MAX_MARGIN_FRACTION = 0.95
 # Simulation assumptions only; change them when you know the fee/slippage model you want.
 PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.7.0'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.8.0'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -363,7 +365,7 @@ def flow_features(symbol):
     return out
 
 
-def score(frames, setup='15', micro=None, live_price=None, btc_context=None):
+def score(frames, setup='15', micro=None, live_price=None, btc_context=None, entry_threshold=ENTRY_SCORE_MIN, strategy='normal'):
     if setup not in frames:
         raise ValueError('unsupported setup timeframe')
     f = {k: frame_features(v) for k, v in frames.items()}
@@ -434,40 +436,81 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None):
     if btc_block_long: ls = max(0.0, ls - 15); reasons_long.append('BTC risk-off -15')
     if btc_block_short: ss = max(0.0, ss - 15); reasons_short.append('BTC risk-on -15')
 
-    long_gate = (b4 == 'LONG' and b1 == 'LONG' and pos <= 0.50 and (bull_sweep or bull_break)
-                 and z.close > z.vwap and z5.close > z5.ema20 and delta > -5 and oi_chg > -5
-                 and not spread_bad and not volatility_bad and not btc_block_long)
-    short_gate = (b4 == 'SHORT' and b1 == 'SHORT' and pos >= 0.50 and (bear_sweep or bear_break)
-                  and z.close < z.vwap and z5.close < z5.ema20 and delta < 5 and oi_chg < 5
-                  and not spread_bad and not volatility_bad and not btc_block_short)
-
-    direction = 'WAIT'; best = max(ls, ss)
-    if ls >= ENTRY_SCORE_MIN and ls > ss and long_gate: direction = 'LONG'
-    elif ss >= ENTRY_SCORE_MIN and ss > ls and short_gate: direction = 'SHORT'
     price = float(live_price if live_price and live_price > 0 else z.close)
+    # Build structural stop/target before deciding. This lets the entry gate reject
+    # trades with poor geometry rather than treating a high market score as permission.
+    long_sl = min(float(z.low), float(frames[setup].low.tail(20).min())) - 0.15 * atrv
+    long_tp = price + 2 * max(price - long_sl, atrv * 0.5)
+    short_sl = max(float(z.high), float(frames[setup].high.tail(20).max())) + 0.15 * atrv
+    short_tp = price - 2 * max(short_sl - price, atrv * 0.5)
+    long_rr = ((long_tp - price) / (price - long_sl)) if long_sl < price else 0.0
+    short_rr = ((price - short_tp) / (short_sl - price)) if short_sl > price else 0.0
+    spread_cost = max(float(spread or 0), 0.0) / 100.0
+    round_trip_cost = 2 * (PAPER_FEE_RATE + PAPER_SLIPPAGE_RATE) + spread_cost
+    long_net_edge = max(0.0, (long_tp - price) / max(price, 1e-12) - round_trip_cost)
+    short_net_edge = max(0.0, (price - short_tp) / max(price, 1e-12) - round_trip_cost)
+
+    def blockers(side):
+        out=[]
+        is_long=side=='LONG'
+        if (b4 if is_long else b4) != side: out.append('4H trend против')
+        if (b1 if is_long else b1) != side: out.append('1H trend против')
+        if is_long and pos > 0.50: out.append('LONG: цена в premium')
+        if not is_long and pos < 0.50: out.append('SHORT: цена в discount')
+        if not (bull_sweep or bull_break) if is_long else not (bear_sweep or bear_break): out.append('нет подтверждения структуры')
+        if is_long and z.close <= z.vwap: out.append('цена ниже VWAP')
+        if not is_long and z.close >= z.vwap: out.append('цена выше VWAP')
+        if is_long and z5.close <= z5.ema20: out.append('5M momentum против')
+        if not is_long and z5.close >= z5.ema20: out.append('5M momentum против')
+        if is_long and delta <= -5: out.append('sell delta')
+        if not is_long and delta >= 5: out.append('buy delta')
+        if is_long and oi_chg <= -5: out.append('OI падает')
+        if not is_long and oi_chg >= 5: out.append('OI растёт против SHORT')
+        if spread_bad: out.append('широкий spread')
+        if volatility_bad: out.append('аномальная волатильность')
+        if is_long and btc_block_long: out.append('BTC risk-off')
+        if not is_long and btc_block_short: out.append('BTC risk-on')
+        rr = long_rr if is_long else short_rr
+        net = long_net_edge if is_long else short_net_edge
+        if rr < ENTRY_RR_MIN: out.append(f'R:R ниже {ENTRY_RR_MIN:g}')
+        if net <= 0: out.append('ожидаемый net edge после расходов ≤ 0')
+        if (ls if is_long else ss) < float(entry_threshold): out.append(f'score ниже {int(entry_threshold)}')
+        return out
+
+    best = max(ls, ss)
+    candidate = 'LONG' if ls > ss else ('SHORT' if ss > ls else 'WAIT')
+    long_blockers = blockers('LONG'); short_blockers = blockers('SHORT')
+    long_gate = not long_blockers
+    short_gate = not short_blockers
+    direction = 'LONG' if candidate=='LONG' and long_gate else ('SHORT' if candidate=='SHORT' and short_gate else 'WAIT')
     if direction == 'LONG':
-        sl = min(float(z.low), float(frames[setup].low.tail(20).min())) - 0.15 * atrv
-        tp = price + 2 * max(price - sl, atrv * 0.5); reasons = reasons_long
+        sl, tp, rr, reasons = long_sl, long_tp, long_rr, reasons_long
     elif direction == 'SHORT':
-        sl = max(float(z.high), float(frames[setup].high.tail(20).max())) + 0.15 * atrv
-        tp = price - 2 * max(sl - price, atrv * 0.5); reasons = reasons_short
+        sl, tp, rr, reasons = short_sl, short_tp, short_rr, reasons_short
     else:
-        sl = tp = None; reasons = reasons_long if ls >= ss else reasons_short
-        reasons.append('entry gate not confirmed' if best >= ENTRY_SCORE_MIN else f'score below {ENTRY_SCORE_MIN}')
-    rr = None
-    if direction == 'LONG' and sl < price: rr = round((tp - price) / (price - sl), 2)
-    elif direction == 'SHORT' and sl > price: rr = round((price - tp) / (sl - price), 2)
+        sl = tp = rr = None
+        reasons = reasons_long if candidate=='LONG' else reasons_short if candidate=='SHORT' else []
+    blockers_out = long_blockers if candidate=='LONG' else short_blockers if candidate=='SHORT' else ['нет явного directional перевеса']
+    if direction == 'WAIT': reasons = list(reasons) + ['BLOCK: '+x for x in blockers_out]
+    regime = 'HIGH_VOLATILITY' if atr_pct > 5 else ('LOW_VOLATILITY' if 0 < atr_pct < 0.08 else ('TREND_UP' if b4=='LONG' and b1=='LONG' else 'TREND_DOWN' if b4=='SHORT' and b1=='SHORT' else 'RANGE'))
+    timing = 'NOW' if direction in ('LONG','SHORT') else ('BREAKOUT' if 'нет подтверждения структуры' in blockers_out else 'WAIT')
+    if candidate=='LONG' and pos > 0.50: timing='PULLBACK'
+    if candidate=='SHORT' and pos < 0.50: timing='PULLBACK'
+    quality = 'A+' if direction in ('LONG','SHORT') and best >= float(entry_threshold)+10 else ('A' if direction in ('LONG','SHORT') else 'WAIT')
     return {
-        'direction': direction, 'score': round(min(100.0, float(best)), 1), 'price': price,
-        'stop_loss': sl, 'take_profit': tp, 'rr': rr, 'htf_1d': bd, 'htf_4h': b4, 'htf_1h': b1,
-        'setup_tf': setup, 'bull_sweep': bull_sweep, 'bear_sweep': bear_sweep,
-        'bull_structure_break': bull_break, 'bear_structure_break': bear_break,
-        'entry_gate_long': long_gate, 'entry_gate_short': short_gate,
-        'range_position': round(pos, 3), 'atr_pct': round(atr_pct, 3), 'reasons': reasons,
-        'long_score': round(min(100.0, ls), 1), 'short_score': round(min(100.0, ss), 1),
-        'oi_change_pct': round(oi_chg, 2), 'orderbook_imbalance': round(ob_imb, 2),
-        'trade_delta_pct': round(delta, 2), 'funding_rate': funding,
-        'spread_pct': round(spread, 4) if spread is not None else None,
+        'direction': direction, 'signal_direction': candidate, 'score': round(min(100.0, float(best)), 1),
+        'entry_score': round(min(100.0, float(best)), 1), 'entry_threshold': int(entry_threshold),
+        'signal_quality': quality, 'decision': f'OPEN {direction}' if direction in ('LONG','SHORT') else 'WAIT',
+        'entry_timing': timing, 'market_regime': regime, 'blockers': blockers_out,
+        'price': price, 'stop_loss': sl, 'take_profit': tp, 'rr': round(rr,2) if rr is not None else None,
+        'expected_net_edge_pct': round((long_net_edge if candidate=='LONG' else short_net_edge)*100, 4),
+        'htf_1d': bd, 'htf_4h': b4, 'htf_1h': b1, 'setup_tf': setup,
+        'bull_sweep': bull_sweep, 'bear_sweep': bear_sweep, 'bull_structure_break': bull_break, 'bear_structure_break': bear_break,
+        'entry_gate_long': long_gate, 'entry_gate_short': short_gate, 'range_position': round(pos, 3), 'atr_pct': round(atr_pct, 3),
+        'reasons': reasons, 'long_score': round(min(100.0, ls), 1), 'short_score': round(min(100.0, ss), 1),
+        'oi_change_pct': round(oi_chg, 2), 'orderbook_imbalance': round(ob_imb, 2), 'trade_delta_pct': round(delta, 2),
+        'funding_rate': funding, 'spread_pct': round(spread, 4) if spread is not None else None,
+        'scalp_time_stop_min': SCALP_TIME_STOP_MIN if strategy=='scalp' else None,
     }
 
 
@@ -524,11 +567,11 @@ def _technical_one(symbol, interval, tm):
             'htf_1d': bd, 'htf_1d': bd, 'htf_4h': b4, 'htf_1h': b1, 'hint': hint, 'frames': frames}
 
 
-def _deep_one(item, interval, btc_context):
+def _deep_one(item, interval, btc_context, entry_threshold=ENTRY_SCORE_MIN, strategy='normal'):
     symbol=item['symbol']; frames=item['frames']
     frames['5'] = klines(symbol, '5', 180)
     # Reuse the 15/60/240 frames already fetched in the technical stage.
-    return score(frames, interval, micro=None, live_price=item['price'], btc_context=btc_context)
+    return score(frames, interval, micro=None, live_price=item['price'], btc_context=btc_context, entry_threshold=entry_threshold, strategy=strategy)
 
 
 def _json_safe(value):
@@ -549,7 +592,7 @@ def _json_safe(value):
     return str(value)
 
 
-def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
+def scan_market(interval='15', limit_symbols=TECH_CANDIDATES, entry_threshold=ENTRY_SCORE_MIN, strategy='normal'):
     if interval not in {'5', '15', '60'}:
         raise ValueError('interval must be 5, 15 or 60')
     universe, tm = _fast_market_universe()
@@ -585,7 +628,7 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
     btc_context={'symbol':'BTCUSDT','bd':btc_item.get('htf_1d'),'b4':btc_item['htf_4h'],'b1':btc_item['htf_1h']} if btc_item else None
     scored=[]
     with ThreadPoolExecutor(max_workers=4) as ex:
-        futures={ex.submit(_deep_one,item,interval,btc_context):item for item in deep}
+        futures={ex.submit(_deep_one,item,interval,btc_context,entry_threshold,strategy):item for item in deep}
         for fut in as_completed(futures):
             item=futures[fut]
             try:
@@ -611,7 +654,7 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
             try:
                 # Frames are still held in the deep item, avoiding duplicate candle calls.
                 item=next(i for i in deep if i['symbol']==s)
-                a=score(item['frames'],interval,micro=micro_map[s],live_price=item['price'],btc_context=btc_context)
+                a=score(item['frames'],interval,micro=micro_map[s],live_price=item['price'],btc_context=btc_context,entry_threshold=entry_threshold,strategy=strategy)
                 a.update({'symbol':s,'turnover24h':x['turnover24h'],'enriched':True}); results.append(a)
                 continue
             except Exception as e: failures.append({'symbol':s,'stage':'rescore','error':str(e)})
@@ -621,7 +664,7 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
             'universe_size':len(universe),'checked':len(top),'technical_checked':len(preliminary),'technical_target':len(top),'technical_skipped':max(0,len(top)-len(preliminary)),
             'deep_checked':len(deep),'deep_target':len(deep),'micro_checked':len(micro_map),'micro_target':len(micro_targets),
             'results':results,'failures':failures,
-            'scan_policy':{'universe':'all active USDT linear perpetuals','technical_cap':TECH_CANDIDATES,
+            'entry_threshold': int(entry_threshold), 'strategy': strategy, 'scan_policy':{'universe':'all active USDT linear perpetuals','technical_cap':TECH_CANDIDATES,
                            'deep_cap':DEEP_CANDIDATES,'micro_cap':MICRO_CANDIDATES,
                            'optimization':'persistent HTTP connections + bounded concurrency + retry/backoff + cached public data'}})
 
@@ -863,7 +906,7 @@ def demo_state():
             stale['stale'] = True
             stale['warnings'] = list(stale.get('warnings') or []) + [f'Баланс временно не обновлён: {e}']
             return stale
-        return {'mode':'demo','configured':True,'degraded':True,'error':'wallet_sync_failed','error_detail':str(e),'warnings':['Не удалось получить баланс Demo. Повторная попытка будет выполнена автоматически.']}
+        return {'mode':MODE,'configured':True,'degraded':True,'error':'wallet_sync_failed','error_detail':str(e),'warnings':['Не удалось получить баланс Demo. Повторная попытка будет выполнена автоматически.']}
     try:
         positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
     except Exception as e:
@@ -886,7 +929,7 @@ def demo_state():
     budget = max(0.0, DEMO_TRADING_BUDGET if MODE == 'demo' else LIVE_TRADING_BUDGET)
     bot_available = max(0.0, min(budget - snap['reserved_margin'], available_margin))
     state = {
-        'mode':'demo','configured':True,'degraded':bool(warnings),'stale':False,'warnings':warnings,
+        'mode':MODE,'configured':True,'degraded':bool(warnings),'stale':False,'warnings':warnings,
         'wallet':wallet,'positions':positions,'closed_pnl':closed[:20],
         'max_positions':MAX_POSITIONS,'trading_budget':budget,'bot_available_budget':round(bot_available, 6),
         'reserved_margin':snap['reserved_margin'],'daily_loss_limit':(DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS),'daily_loss':daily_loss,

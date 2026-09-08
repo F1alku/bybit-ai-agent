@@ -7,7 +7,7 @@ Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 - Fast market-wide pass -> up to 24 technical candidates -> 12 deep -> 6 micro.
 - Multi-timeframe: 4H + 1H + setup timeframe + 5M microstructure.
 - OI, order-book imbalance, trade delta, funding, spread and BTC regime are included where available.
-- Entry gate currently requires LONG/SHORT and score >= 70 plus SL/TP.
+- Entry logic v5.8: separate NORMAL/SCALP thresholds, 1D/4H/1H regime, structure/VWAP/momentum/flow gates, R:R >= 1.5, estimated net edge after fee/spread/slippage, exact blocker reasons, and signal quality A/A+. SCALP uses 5M setup and a configurable time-stop hint.
 - No averaging down and no martingale.
 
 ## Demo risk model

@@ -12,7 +12,14 @@ def _strategy_config():
         mode = strategy_state.get('mode', mode)
     except Exception:
         pass
-    return mode, ('5' if mode == 'scalp' else '15'), (60 if mode == 'scalp' else 70)
+    
+        from journal import get_setting
+        normal_gate = int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70')))
+        scalp_gate = int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))
+    except Exception:
+        normal_gate = int(os.getenv('NORMAL_SCORE_GATE','70'))
+        scalp_gate = int(os.getenv('SCALP_SCORE_GATE','60'))
+    return mode, ('5' if mode == 'scalp' else '15'), (scalp_gate if mode == 'scalp' else normal_gate)
 
 
 SCAN_CANDIDATES = 24
@@ -30,11 +37,12 @@ def run_auto_cycle():
             return None, 'risk lock active — no new exchange entry', None
         if len(state.get('positions', [])) >= MAX_POSITIONS:
             return None, f'max {MAX_POSITIONS} exchange positions — monitoring', None
-        result = scan_market(setup_interval, SCAN_CANDIDATES)
+        result = scan_market(setup_interval, SCAN_CANDIDATES, entry_threshold=score_gate, strategy=strategy)
         candidates = [x for x in result.get('results', [])
                       if x.get('direction') in ('LONG','SHORT')
                       and float(x.get('score',0)) >= score_gate
-                      and x.get('stop_loss') and x.get('take_profit')]
+                      and x.get('stop_loss') and x.get('take_profit')
+                      and x.get('decision') in (f'OPEN {x.get("direction")}',)]
         candidates.sort(key=lambda x: float(x.get('score',0)), reverse=True)
         opened, rejected = [], []
         for x in candidates[:MAX_POSITIONS]:
@@ -55,10 +63,11 @@ def run_auto_cycle():
         return None, 'risk lock active — no paper entry', None
     if len(state.get('open', [])) >= MAX_POSITIONS:
         return None, f'max {MAX_POSITIONS} paper positions — monitoring', None
-    result = scan_market(setup_interval, SCAN_CANDIDATES)
+    result = scan_market(setup_interval, SCAN_CANDIDATES, entry_threshold=score_gate, strategy=strategy)
     candidates = [x for x in result.get('results', [])
                   if x.get('direction') in ('LONG','SHORT') and float(x.get('score',0)) >= score_gate
-                  and x.get('stop_loss') and x.get('take_profit')]
+                  and x.get('stop_loss') and x.get('take_profit')
+                      and x.get('decision') in (f'OPEN {x.get("direction")}',)]
     candidates.sort(key=lambda x: float(x.get('score',0)), reverse=True)
     opened=[]; rejected=[]
     for x in candidates[:MAX_POSITIONS]:

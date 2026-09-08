@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position
-from journal import init_db, recent as journal_recent, sync_closed_pnl
+from journal import init_db, recent as journal_recent, sync_closed_pnl, get_setting, set_setting
 from trader import run_auto_cycle
 
 AUTO_INTERVAL_SEC = 180
@@ -21,7 +21,7 @@ scan_lock = threading.Lock()
 scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
-strategy_state = {'mode': os.getenv('STRATEGY_MODE','normal').lower() if os.getenv('STRATEGY_MODE','normal').lower() in ('normal','scalp') else 'normal', 'normal_gate': int(os.getenv('NORMAL_SCORE_GATE','70')), 'scalp_gate': int(os.getenv('SCALP_SCORE_GATE','60'))}
+strategy_state = {'mode': os.getenv('STRATEGY_MODE','normal').lower() if os.getenv('STRATEGY_MODE','normal').lower() in ('normal','scalp') else 'normal', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
 auto_state = {'enabled': os.getenv('AUTO_ENABLED','false').lower() == 'true', 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0}
 
 @asynccontextmanager
@@ -38,7 +38,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.7.2', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.8.0', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -107,7 +107,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.7.3', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.8.0', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -121,6 +121,7 @@ class StrategyGateRequest(BaseModel):
 def strategy_gate(req: StrategyGateRequest):
     with auto_lock:
         strategy_state['normal_gate' if req.mode == 'normal' else 'scalp_gate'] = req.score_gate
+        set_setting('normal_gate' if req.mode == 'normal' else 'scalp_gate', req.score_gate)
     return strategy_status()
 
 @app.post('/api/strategy/toggle')
@@ -151,9 +152,9 @@ def markets():
     try: return {'ok': True, 'markets': market_snapshot(20)}
     except Exception as e: raise HTTPException(status_code=502, detail=str(e))
 
-def _run_scan_job(job_id, interval, limit_symbols):
+def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy):
     try:
-        result = scan_market(interval, limit_symbols)
+        result = scan_market(interval, limit_symbols, entry_threshold=entry_threshold, strategy=strategy)
         with scan_jobs_lock:
             scan_jobs[job_id] = {'status': 'done', 'result': result}
     except Exception as e:
@@ -174,7 +175,7 @@ def scan(req: ScanRequest):
             for old_id in list(scan_jobs)[:-20]:
                 scan_jobs.pop(old_id, None)
     try:
-        scan_executor.submit(_run_scan_job, job_id, req.interval, req.limit_symbols)
+        scan_executor.submit(_run_scan_job, job_id, req.interval, req.limit_symbols, strategy_state['scalp_gate'] if strategy_state['mode']=='scalp' else strategy_state['normal_gate'], strategy_state['mode'])
     except Exception as e:
         scan_lock.release()
         with scan_jobs_lock:

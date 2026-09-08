@@ -74,6 +74,10 @@ def init_db():
                 raw_json TEXT,
                 synced_at REAL NOT NULL
             )''')
+        if _is_pg():
+            cur.execute('''CREATE TABLE IF NOT EXISTS agent_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
+        else:
+            cur.execute('''CREATE TABLE IF NOT EXISTS agent_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
 
 
 def upsert_closed_pnl(mode, item):
@@ -126,3 +130,24 @@ def recent(limit=100):
         else:
             cur.execute('SELECT external_id,mode,symbol,side,qty,entry_price,exit_price,pnl,fee,created_ms,updated_ms,reason FROM trade_journal ORDER BY COALESCE(updated_ms,0) DESC LIMIT ?', (int(limit),))
         return [dict(r) for r in cur.fetchall()]
+
+
+def get_setting(key, default=None):
+    init_db()
+    with _lock, _conn() as c:
+        cur=c.cursor()
+        if _is_pg(): cur.execute('SELECT value FROM agent_settings WHERE key=%s',(str(key),))
+        else: cur.execute('SELECT value FROM agent_settings WHERE key=?',(str(key),))
+        row=cur.fetchone()
+        if not row: return default
+        return row[0] if not isinstance(row, dict) else row.get('value', default)
+
+def set_setting(key, value):
+    init_db()
+    with _lock, _conn() as c:
+        cur=c.cursor()
+        if _is_pg():
+            cur.execute('''INSERT INTO agent_settings(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value''',(str(key),str(value)))
+        else:
+            cur.execute('''INSERT INTO agent_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value''',(str(key),str(value)))
+    return str(value)
