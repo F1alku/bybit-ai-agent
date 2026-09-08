@@ -57,7 +57,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.8.0'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.8.1'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -453,19 +453,15 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None, ent
     def blockers(side):
         out=[]
         is_long=side=='LONG'
-        if (b4 if is_long else b4) != side: out.append('4H trend против')
-        if (b1 if is_long else b1) != side: out.append('1H trend против')
-        if is_long and pos > 0.50: out.append('LONG: цена в premium')
-        if not is_long and pos < 0.50: out.append('SHORT: цена в discount')
-        if not (bull_sweep or bull_break) if is_long else not (bear_sweep or bear_break): out.append('нет подтверждения структуры')
-        if is_long and z.close <= z.vwap: out.append('цена ниже VWAP')
-        if not is_long and z.close >= z.vwap: out.append('цена выше VWAP')
-        if is_long and z5.close <= z5.ema20: out.append('5M momentum против')
-        if not is_long and z5.close >= z5.ema20: out.append('5M momentum против')
-        if is_long and delta <= -5: out.append('sell delta')
-        if not is_long and delta >= 5: out.append('buy delta')
-        if is_long and oi_chg <= -5: out.append('OI падает')
-        if not is_long and oi_chg >= 5: out.append('OI растёт против SHORT')
+        # Hard blockers are intentionally limited. Most market signals are soft
+        # evidence that affects score rather than binary gates, otherwise a valid
+        # setup can be rejected by one noisy microstructure reading.
+        if b4 == ('SHORT' if is_long else 'LONG'): out.append('4H trend против')
+        if b1 == ('SHORT' if is_long else 'LONG'): out.append('1H trend против')
+        if is_long:
+            if not (bull_sweep or bull_break): out.append('нет подтверждения структуры')
+        else:
+            if not (bear_sweep or bear_break): out.append('нет подтверждения структуры')
         if spread_bad: out.append('широкий spread')
         if volatility_bad: out.append('аномальная волатильность')
         if is_long and btc_block_long: out.append('BTC risk-off')
