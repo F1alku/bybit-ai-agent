@@ -21,6 +21,7 @@ scan_lock = threading.Lock()
 scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
+strategy_state = {'mode': os.getenv('STRATEGY_MODE','normal').lower() if os.getenv('STRATEGY_MODE','normal').lower() in ('normal','scalp') else 'normal', 'normal_gate': int(os.getenv('NORMAL_SCORE_GATE','70')), 'scalp_gate': int(os.getenv('SCALP_SCORE_GATE','60'))}
 auto_state = {'enabled': os.getenv('AUTO_ENABLED','false').lower() == 'true', 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0}
 
 @asynccontextmanager
@@ -106,7 +107,28 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.7.1', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.7.3', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+
+@app.get('/api/strategy')
+def strategy_status():
+    return {'ok': True, 'strategy': strategy_state['mode'], 'label': 'SCALP' if strategy_state['mode']=='scalp' else 'NORMAL', 'normal_gate': strategy_state['normal_gate'], 'scalp_gate': strategy_state['scalp_gate']}
+
+class StrategyGateRequest(BaseModel):
+    mode: str = Field(..., pattern=r'^(normal|scalp)$')
+    score_gate: int = Field(..., ge=0, le=100)
+
+@app.post('/api/strategy/gate')
+def strategy_gate(req: StrategyGateRequest):
+    with auto_lock:
+        strategy_state['normal_gate' if req.mode == 'normal' else 'scalp_gate'] = req.score_gate
+    return strategy_status()
+
+@app.post('/api/strategy/toggle')
+def strategy_toggle():
+    with auto_lock:
+        strategy_state['mode'] = 'scalp' if strategy_state['mode'] == 'normal' else 'normal'
+        auto_state['last_action'] = f"strategy switched to {strategy_state['mode'].upper()}"
+    return strategy_status()
 
 @app.get('/api/auto')
 def auto_status():

@@ -367,6 +367,7 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None):
     if setup not in frames:
         raise ValueError('unsupported setup timeframe')
     f = {k: frame_features(v) for k, v in frames.items()}
+    bd = bias(frames['D']) if 'D' in frames else 'NEUTRAL'
     b4, b1 = bias(frames['240']), bias(frames['60'])
     setup_df = f[setup]; z = setup_df.iloc[-1]
     hi, lo = setup_df.high.tail(50).max(), setup_df.low.tail(50).min()
@@ -378,6 +379,8 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None):
     delta = float(micro.get('trade_delta_pct') or 0); funding = float(micro.get('funding_rate') or 0)
     spread = micro.get('spread_pct')
     ls = ss = 0.0; reasons_long, reasons_short = [], []
+    if bd == 'LONG': ls += 10; reasons_long.append('1D trend')
+    elif bd == 'SHORT': ss += 10; reasons_short.append('1D trend')
     if b4 == 'LONG': ls += 20; reasons_long.append('4H trend')
     elif b4 == 'SHORT': ss += 20; reasons_short.append('4H trend')
     if b1 == 'LONG': ls += 15; reasons_long.append('1H trend')
@@ -456,7 +459,7 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None):
     elif direction == 'SHORT' and sl > price: rr = round((price - tp) / (sl - price), 2)
     return {
         'direction': direction, 'score': round(min(100.0, float(best)), 1), 'price': price,
-        'stop_loss': sl, 'take_profit': tp, 'rr': rr, 'htf_4h': b4, 'htf_1h': b1,
+        'stop_loss': sl, 'take_profit': tp, 'rr': rr, 'htf_1d': bd, 'htf_4h': b4, 'htf_1h': b1,
         'setup_tf': setup, 'bull_sweep': bull_sweep, 'bear_sweep': bear_sweep,
         'bull_structure_break': bull_break, 'bear_structure_break': bear_break,
         'entry_gate_long': long_gate, 'entry_gate_short': short_gate,
@@ -469,7 +472,7 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None):
 
 
 def _scan_one(symbol, setup, live_price, micro=None, btc_context=None):
-    frames = {k: klines(symbol, k, 220) for k in ['5', '15', '60', '240']}
+    frames = {k: klines(symbol, k, 220) for k in ['5', '15', '60', '240', 'D']}
     return score(frames, setup, micro=micro, live_price=live_price, btc_context=btc_context)
 
 
@@ -505,20 +508,20 @@ def _fast_market_universe():
 def _technical_one(symbol, interval, tm):
     # Cheap technical pass: 4H + 1H + setup. 5M and microstructure wait for the shortlist.
     setup = str(interval)
-    frames = {k: klines(symbol, k, 180) for k in sorted({'15', '60', '240', setup}, key=lambda x: ['5','15','60','240'].index(x))}
-    b4, b1 = bias(frames['240']), bias(frames['60'])
+    frames = {k: klines(symbol, k, 180) for k in sorted({'15', '60', '240', 'D', setup}, key=lambda x: ['5','15','60','240','D'].index(x))}
+    bd, b4, b1 = bias(frames['D']), bias(frames['240']), bias(frames['60'])
     fsetup = frame_features(frames[setup]); z = fsetup.iloc[-1]
     bull_sweep, bear_sweep = sweep(frames[setup])
     bull_break, bear_break = structure_confirmation(frames[setup])
     hi, lo = frames[setup].high.tail(50).max(), frames[setup].low.tail(50).min()
     rng = max(float(hi-lo), 1e-12); pos = (float(z.close)-float(lo))/rng
-    long_hint = (20 if b4=='LONG' else 0) + (15 if b1=='LONG' else 0) + (12 if bull_sweep else 0) + (10 if bull_break else 0) + (8 if pos <= .45 else 0)
-    short_hint = (20 if b4=='SHORT' else 0) + (15 if b1=='SHORT' else 0) + (12 if bear_sweep else 0) + (10 if bear_break else 0) + (8 if pos >= .55 else 0)
+    long_hint = (10 if bd=='LONG' else 0) + (20 if b4=='LONG' else 0) + (15 if b1=='LONG' else 0) + (12 if bull_sweep else 0) + (10 if bull_break else 0) + (8 if pos <= .45 else 0)
+    short_hint = (10 if bd=='SHORT' else 0) + (20 if b4=='SHORT' else 0) + (15 if b1=='SHORT' else 0) + (12 if bear_sweep else 0) + (10 if bear_break else 0) + (8 if pos >= .55 else 0)
     hint = max(long_hint, short_hint)
     return {'symbol': symbol, 'price': float(tm[symbol].get('lastPrice') or z.close),
             'turnover24h': float(tm[symbol].get('turnover24h') or 0),
             'spreadPct': float(((float(tm[symbol].get('ask1Price') or 0)-float(tm[symbol].get('bid1Price') or 0))/max(float(tm[symbol].get('lastPrice') or 1),1e-9))*100),
-            'htf_4h': b4, 'htf_1h': b1, 'hint': hint, 'frames': frames}
+            'htf_1d': bd, 'htf_1d': bd, 'htf_4h': b4, 'htf_1h': b1, 'hint': hint, 'frames': frames}
 
 
 def _deep_one(item, interval, btc_context):
@@ -579,7 +582,7 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES):
     deep=preliminary[:DEEP_CANDIDATES]
     btc_item=next((x for x in preliminary if x['symbol']=='BTCUSDT'),None)
     if btc_item and all(x['symbol']!='BTCUSDT' for x in deep): deep[-1]=btc_item
-    btc_context={'symbol':'BTCUSDT','b4':btc_item['htf_4h'],'b1':btc_item['htf_1h']} if btc_item else None
+    btc_context={'symbol':'BTCUSDT','bd':btc_item.get('htf_1d'),'b4':btc_item['htf_4h'],'b1':btc_item['htf_1h']} if btc_item else None
     scored=[]
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures={ex.submit(_deep_one,item,interval,btc_context):item for item in deep}
