@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position
 from journal import init_db, recent as journal_recent, sync_closed_pnl, get_setting, set_setting
+from news_engine import snapshot as news_snapshot
 from trader import run_auto_cycle
 
 AUTO_INTERVAL_SEC = 180
@@ -38,7 +39,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.8.2', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.10.1', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -107,7 +108,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.8.2', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.10.1', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -146,6 +147,13 @@ def auto_toggle():
         auto_state['enabled'] = not auto_state['enabled']
         auto_state['last_action'] = 'enabled by user' if auto_state['enabled'] else 'disabled by user'
     return auto_status()
+
+@app.get('/api/news')
+def news():
+    try:
+        return news_snapshot(force=True)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 @app.get('/api/markets')
 def markets():

@@ -12,6 +12,7 @@ import os
 import hashlib
 import hmac
 import json
+from news_engine import snapshot as news_snapshot, apply_to_signal as apply_news_to_signal
 
 MODE = os.getenv('BYBIT_MODE', 'paper').lower()
 if MODE not in ('paper', 'demo', 'live'):
@@ -38,6 +39,8 @@ DEMO_RISK_PCT = float(os.getenv('DEMO_RISK_PCT', '2'))
 LIVE_TRADING_BUDGET = float(os.getenv('LIVE_TRADING_BUDGET', '100'))
 LIVE_MAX_DAILY_LOSS = float(os.getenv('LIVE_MAX_DAILY_LOSS', '20'))
 LIVE_RISK_PCT = float(os.getenv('LIVE_RISK_PCT', '2'))
+BOT_BASE_CAPITAL = float(os.getenv('BOT_BASE_CAPITAL', '10'))
+PROFIT_LOCK_STEP = float(os.getenv('PROFIT_LOCK_STEP', '5'))
 
 # Scan budget: broad market discovery is one ticker request; expensive candle/microstructure
 # calls are reserved for a small ranked subset.
@@ -57,7 +60,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.8.1'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.10.1'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -132,7 +135,7 @@ def bybit_get(path, params):
             time.sleep(0.45 * (2 ** attempt))
     raise last_error or RuntimeError('Bybit request failed')
 
-def bybit_private_post(path, body):
+def bybit_private_post(path, body, allow_ret_codes=None):
     if MODE == 'demo':
         key, secret = DEMO_API_KEY, DEMO_API_SECRET
     elif MODE == 'live':
@@ -141,6 +144,7 @@ def bybit_private_post(path, body):
     else:
         raise RuntimeError('Private Bybit API is disabled in paper mode')
     if not key or not secret: raise RuntimeError(f'{MODE.upper()} API key/secret are not configured')
+    allow_ret_codes = {int(x) for x in (allow_ret_codes or ())}
     # Never blindly retry order creation: a network timeout can happen after Bybit accepted
     # the order, and a retry could create a duplicate. Non-order control endpoints are safe
     # to retry on transient transport/server failures.
@@ -156,8 +160,9 @@ def bybit_private_post(path, body):
                 j = r.json()
             except ValueError:
                 raise RuntimeError(f'Bybit returned invalid JSON (HTTP {r.status_code})')
-            if j.get('retCode') != 0:
-                raise RuntimeError(f"Bybit {j.get('retCode')}: {j.get('retMsg', 'API error')}")
+            ret_code = int(j.get('retCode', 0))
+            if ret_code != 0 and ret_code not in allow_ret_codes:
+                raise RuntimeError(f"Bybit {ret_code}: {j.get('retMsg', 'API error')}")
             return j.get('result', {})
         except httpx.HTTPStatusError as e:
             last_error = RuntimeError(f'Bybit HTTP {e.response.status_code}')
@@ -593,7 +598,7 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES, entry_threshold=EN
         raise ValueError('interval must be 5, 15 or 60')
     universe, tm = _fast_market_universe()
     if not universe:
-        return {'ok': True, 'mode':MODE, 'setup_interval':interval, 'universe_size':0, 'checked':0, 'technical_checked':0, 'deep_checked':0, 'micro_checked':0, 'results':[], 'failures':[]}
+        return {'ok': True, 'mode':MODE, 'setup_interval':interval, 'universe_size':0, 'checked':0, 'technical_checked':0, 'deep_checked':0, 'micro_checked':0, 'results':[], 'failures':[], 'news': news_snapshot()}
 
     # Always include BTC if it is a valid market; it is a regime filter, not a trade candidate priority.
     top = universe[:TECH_CANDIDATES]
@@ -656,10 +661,20 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES, entry_threshold=EN
             except Exception as e: failures.append({'symbol':s,'stage':'rescore','error':str(e)})
         x.pop('frames',None); results.append(x)
     results.sort(key=lambda x:x.get('score',x.get('hint',0)), reverse=True)
+    # News is a contextual filter, not an independent signal. A headline only blocks
+    # when relevance is high and BTC/market reaction confirms it.
+    try:
+        news = news_snapshot()
+        for x in results:
+            apply_news_to_signal(x, news, strategy=strategy)
+    except Exception as e:
+        failures.append({'stage':'news','error':str(e)})
+        news = {'status':'error','impact':'unknown','items':[],'btc_reaction':{'strength':'unknown','pct_15m':0,'pct_30m':0}}
     return _json_safe({'ok':True,'mode':MODE,'setup_interval':interval,
             'universe_size':len(universe),'checked':len(top),'technical_checked':len(preliminary),'technical_target':len(top),'technical_skipped':max(0,len(top)-len(preliminary)),
             'deep_checked':len(deep),'deep_target':len(deep),'micro_checked':len(micro_map),'micro_target':len(micro_targets),
             'results':results,'failures':failures,
+            'news': news,
             'entry_threshold': int(entry_threshold), 'strategy': strategy, 'scan_policy':{'universe':'all active USDT linear perpetuals','technical_cap':TECH_CANDIDATES,
                            'deep_cap':DEEP_CANDIDATES,'micro_cap':MICRO_CANDIDATES,
                            'optimization':'persistent HTTP connections + bounded concurrency + retry/backoff + cached public data'}})
@@ -739,6 +754,93 @@ def bybit_private_get(path, params, retries=PRIVATE_RETRY_COUNT):
             time.sleep(0.5 * (2 ** attempt))
     raise last_error or RuntimeError('Bybit private request failed')
 
+def _capital_defaults():
+    base = max(0.01, float(BOT_BASE_CAPITAL))
+    step = max(0.01, float(PROFIT_LOCK_STEP))
+    return base, step
+
+
+def _bot_capital_state():
+    """Persistent virtual trading capital; protected profit is never available for new risk."""
+    from journal import get_setting, set_setting, realized_total
+    base, step = _capital_defaults()
+    raw = get_setting('bot_capital_state')
+    if raw:
+        try:
+            state = json.loads(raw)
+            if state.get('version') == 1:
+                return state
+        except Exception:
+            pass
+    # Establish the baseline at the moment this feature is first enabled so old
+    # Demo P&L cannot accidentally become new trading capital.
+    baseline = realized_total(MODE) if MODE in ('demo', 'live') else 0.0
+    state = {
+        'version': 1,
+        'base_capital': round(base, 8),
+        'trading_capital': round(base, 8),
+        'locked_profit': 0.0,
+        'realized_baseline': round(baseline, 8),
+        'realized_seen': round(baseline, 8),
+        'last_lock_at': int(time.time() * 1000),
+    }
+    set_setting('bot_capital_state', json.dumps(state, separators=(',', ':')))
+    return state
+
+
+def _sync_bot_capital():
+    """Apply exchange-authoritative realized net P&L to bot capital."""
+    from journal import get_setting, set_setting, realized_total, sync_closed_pnl
+    state = _bot_capital_state()
+    if MODE in ('demo', 'live'):
+        # Keep the virtual capital ledger synchronized automatically; UI/journal
+        # requests must not be required for profit-locking to work. The account
+        # cache is short-lived, so this does not hammer the endpoint every cycle.
+        try:
+            sync_closed_pnl(MODE, _demo_closed_pnl(100))
+        except Exception:
+            pass
+    current = realized_total(MODE) if MODE in ('demo', 'live') else state['realized_seen']
+    seen = float(state.get('realized_seen', state.get('realized_baseline', 0.0)))
+    delta = current - seen
+    if abs(delta) > 1e-12:
+        state['trading_capital'] = max(0.0, float(state['trading_capital']) + delta)
+        state['realized_seen'] = current
+    base = float(state['base_capital'])
+    step = max(0.01, float(PROFIT_LOCK_STEP))
+    # Lock only realized net profit above the base. Losses reduce trading capital;
+    # they never unlock previously protected profit.
+    already_locked = float(state.get('locked_profit', 0.0))
+    net_profit = float(state['trading_capital']) + already_locked - base
+    target_locked = max(already_locked, math.floor(max(0.0, net_profit) / step) * step)
+    if target_locked > already_locked + 1e-9:
+        increase = target_locked - already_locked
+        state['locked_profit'] = target_locked
+        state['trading_capital'] = max(0.0, float(state['trading_capital']) - increase)
+        state['last_lock_at'] = int(time.time() * 1000)
+    state['trading_capital'] = round(max(0.0, float(state['trading_capital'])), 8)
+    state['locked_profit'] = round(max(0.0, float(state.get('locked_profit', 0.0))), 8)
+    state['realized_seen'] = round(current, 8)
+    set_setting('bot_capital_state', json.dumps(state, separators=(',', ':')))
+    return state
+
+
+def _bot_capital_view(unrealized_pnl=0.0, reserved_margin=0.0):
+    state = _sync_bot_capital()
+    trading = float(state['trading_capital'])
+    # Unrealized gains do not increase risk budget; unrealized losses do reduce it.
+    risk_equity = max(0.0, trading + min(0.0, float(unrealized_pnl)))
+    available = max(0.0, risk_equity - float(reserved_margin))
+    return {
+        'base_capital': round(float(state['base_capital']), 6),
+        'trading_capital': round(trading, 6),
+        'locked_profit': round(float(state['locked_profit']), 6),
+        'bot_equity': round(risk_equity, 6),
+        'bot_available_capital': round(available, 6),
+        'profit_lock_step': round(float(PROFIT_LOCK_STEP), 6),
+    }
+
+
 def _demo_wallet():
     key = ('wallet',)
     cached = _private_cached(key, DEMO_ACCOUNT_CACHE_TTL)
@@ -808,7 +910,13 @@ def _demo_risk_qty(symbol, entry, sl):
     available, equity, _ = _demo_available_usdt()
     budget_limit = DEMO_TRADING_BUDGET if MODE == 'demo' else LIVE_TRADING_BUDGET
     risk_pct = DEMO_RISK_PCT if MODE == 'demo' else LIVE_RISK_PCT
-    budget = min(budget_limit, available)
+    positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
+    reserved_margin = sum(abs(float(x.get('positionIM') or 0)) for x in positions)
+    unrealized = sum(float(x.get('unrealisedPnl') or 0) for x in positions)
+    cap = _bot_capital_view(unrealized_pnl=unrealized, reserved_margin=reserved_margin)
+    # The Bybit wallet is only the funding source. New bot risk is capped by the
+    # separate virtual trading capital and cannot consume protected profit.
+    budget = min(budget_limit, cap['bot_available_capital'], available)
     risk_cash = min(equity, budget) * risk_pct / 100
     dist = abs(entry - sl)
     if dist <= 0: raise ValueError('invalid stop distance')
@@ -821,8 +929,8 @@ def _demo_risk_qty(symbol, entry, sl):
         qty = _round_step((budget * MAX_MARGIN_FRACTION * LEVERAGE) / entry, step) if step else (budget * MAX_MARGIN_FRACTION * LEVERAGE) / entry
         margin = entry * qty / LEVERAGE
     if qty <= 0 or (min_qty > 0 and qty < min_qty):
-        raise ValueError(f'Demo position too small: available trading budget ${budget:.2f}')
-    return qty, margin, available, equity
+        raise ValueError(f'Demo position too small: available bot capital ${budget:.2f}')
+    return qty, margin, available, equity, cap
 
 
 
@@ -847,12 +955,18 @@ def demo_open(d):
     positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
     if len(positions) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} demo positions')
     if any(x.get('symbol') == symbol for x in positions): raise ValueError('Position for this symbol already open')
-    qty, margin, available, equity = _demo_risk_qty(symbol, entry, sl)
+    qty, margin, available, equity, cap = _demo_risk_qty(symbol, entry, sl)
     daily_loss, locked = _demo_guard_status(equity)
     limit = DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
     if locked: raise ValueError(f'Daily loss limit reached: ${daily_loss:.2f} / ${limit:.2f}')
-    # Set leverage first. If account is already at the desired leverage, Bybit returns success.
-    bybit_private_post('/v5/position/set-leverage', {'category':'linear','symbol':symbol,'buyLeverage':str(int(LEVERAGE)),'sellLeverage':str(int(LEVERAGE))})
+    # Set leverage first. Bybit returns 110043 when the requested leverage is
+    # already set. That is a successful no-op for our purpose, so do not block
+    # the order on it.
+    bybit_private_post(
+        '/v5/position/set-leverage',
+        {'category':'linear','symbol':symbol,'buyLeverage':str(int(LEVERAGE)),'sellLeverage':str(int(LEVERAGE))},
+        allow_ret_codes={110043},
+    )
     order = {
         'category':'linear','symbol':symbol,'side':'Buy' if side == 'LONG' else 'Sell','orderType':'Market','qty':str(qty),
         'positionIdx':0,'reduceOnly':False,'takeProfit':str(tp),'stopLoss':str(sl),
@@ -860,7 +974,7 @@ def demo_open(d):
     }
     result = bybit_private_post('/v5/order/create', order)
     _invalidate_demo_account_cache()
-    return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'order':result}
+    return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'bot_capital':cap,'order':result}
 
 
 def exchange_positions():
@@ -923,11 +1037,14 @@ def demo_state():
     daily_loss = snap['daily_loss']
     locked = daily_loss >= (DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS)
     budget = max(0.0, DEMO_TRADING_BUDGET if MODE == 'demo' else LIVE_TRADING_BUDGET)
-    bot_available = max(0.0, min(budget - snap['reserved_margin'], available_margin))
+    cap = _bot_capital_view(unrealized_pnl=snap['unrealized_pnl'], reserved_margin=snap['reserved_margin'])
+    bot_available = min(budget, cap['bot_available_capital'], available_margin)
     state = {
         'mode':MODE,'configured':True,'degraded':bool(warnings),'stale':False,'warnings':warnings,
         'wallet':wallet,'positions':positions,'closed_pnl':closed[:20],
         'max_positions':MAX_POSITIONS,'trading_budget':budget,'bot_available_budget':round(bot_available, 6),
+        'base_capital':cap['base_capital'],'trading_capital':cap['trading_capital'],'locked_profit':cap['locked_profit'],
+        'bot_equity':cap['bot_equity'],'bot_available_capital':cap['bot_available_capital'],'profit_lock_step':cap['profit_lock_step'],
         'reserved_margin':snap['reserved_margin'],'daily_loss_limit':(DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS),'daily_loss':daily_loss,
         'daily_pnl':snap['daily_pnl'],'realized_pnl_today':snap['realized_pnl_today'],
         'realized_pnl_7d':snap['realized_pnl_7d'],'unrealized_pnl':snap['unrealized_pnl'],
@@ -960,6 +1077,17 @@ def paper_state():
             t['mark_price'] = round(mark, 10)
             t['unrealized_pnl'] = round(gross, 6)
             t['unrealized_pnl_pct'] = round(gross / max(t.get('margin_required', 1e-9), 1e-9) * 100, 3)
+        # Paper mode uses the same protected-profit concept in memory so it can be tested
+        # without an exchange account.
+        base = START_BALANCE
+        locked = max(0.0, math.floor(max(0.0, total_pnl) / max(PROFIT_LOCK_STEP, 0.01)) * max(PROFIT_LOCK_STEP, 0.01))
+        locked = min(locked, max(0.0, s['balance'] - base + locked))
+        s['base_capital'] = round(base, 6)
+        s['locked_profit'] = round(locked, 6)
+        s['trading_capital'] = round(max(0.0, s['balance'] - locked), 6)
+        s['bot_equity'] = round(max(0.0, s['trading_capital'] + min(0.0, unrealized_pnl)), 6)
+        s['bot_available_capital'] = round(max(0.0, s['bot_equity'] - s['reserved_margin']), 6)
+        s['profit_lock_step'] = round(max(PROFIT_LOCK_STEP, 0.01), 6)
         s['risk_locked'] = s['daily_loss_pct'] >= DAILY_LOSS_LIMIT_PCT or s['loss_streak'] >= MAX_CONSECUTIVE_LOSSES
         wins = sum(1 for t in _state['trades'] if t.get('pnl', 0) > 0); losses = sum(1 for t in _state['trades'] if t.get('pnl', 0) < 0)
         s['win_rate'] = round(wins / max(1, wins + losses) * 100, 2)
@@ -999,12 +1127,12 @@ def paper_open(d):
         if _state['last_loss_at'] and time.time() - _state['last_loss_at'] < LOSS_COOLDOWN_SEC: raise ValueError('cooldown active after loss')
         if len(_state['open']) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} open positions')
         if any(x['symbol'] == symbol for x in _state['open']): raise ValueError('position for this symbol already open')
-        dist = abs(entry - sl); risk = _state['balance'] * risk_pct / 100
+        dist = abs(entry - sl); current_unrealized = _paper_equity_locked()[1]; locked = max(0.0, math.floor(max(0.0, (_state['balance'] - _state['initial_balance'] + current_unrealized)) / max(PROFIT_LOCK_STEP, 0.01)) * max(PROFIT_LOCK_STEP, 0.01)); trading_capital = max(0.0, _state['balance'] - locked); risk = max(0.0, trading_capital + min(0.0, current_unrealized)) * risk_pct / 100
         qty = risk / dist
         step, min_qty, max_qty = _symbol_rules(symbol)
         qty = _round_step(qty, step) if step else qty
         if max_qty > 0: qty = min(qty, max_qty)
-        budget = min(_state.get('trading_budget', _state['balance']), _state['balance'])
+        budget = min(_state.get('trading_budget', _state['balance']), trading_capital)
         reserved = sum(float(x.get('margin_required', 0)) for x in _state['open'])
         free_budget = max(0.0, budget - reserved)
         margin_required = entry * qty / LEVERAGE

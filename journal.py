@@ -87,7 +87,7 @@ def upsert_closed_pnl(mode, item):
         ext, mode, str(item.get('symbol') or ''), str(item.get('side') or ''),
         float(item.get('qty') or 0), float(item.get('avgEntryPrice') or item.get('entryPrice') or 0),
         float(item.get('avgExitPrice') or item.get('exitPrice') or 0), float(item.get('closedPnl') or 0),
-        float(item.get('cumEntryValue') or 0) * 0,  # fee is not guaranteed on closed-pnl payload
+        float(item.get('openFee') or 0) + float(item.get('closeFee') or 0),
         int(item.get('createdTime') or 0), int(item.get('updatedTime') or 0),
         'bybit_closed_pnl', json.dumps(item, ensure_ascii=False, separators=(',', ':')), time.time()
     )
@@ -130,6 +130,22 @@ def recent(limit=100):
         else:
             cur.execute('SELECT external_id,mode,symbol,side,qty,entry_price,exit_price,pnl,fee,created_ms,updated_ms,reason FROM trade_journal ORDER BY COALESCE(updated_ms,0) DESC LIMIT ?', (int(limit),))
         return [dict(r) for r in cur.fetchall()]
+
+
+def realized_total(mode=None):
+    """Return the persisted sum of realized P&L in the journal."""
+    init_db()
+    with _lock, _conn() as c:
+        cur = c.cursor()
+        if mode:
+            if _is_pg():
+                cur.execute('SELECT COALESCE(SUM(pnl - fee),0) FROM trade_journal WHERE mode=%s', (str(mode),))
+            else:
+                cur.execute('SELECT COALESCE(SUM(pnl - fee),0) FROM trade_journal WHERE mode=?', (str(mode),))
+        else:
+            cur.execute('SELECT COALESCE(SUM(pnl - fee),0) FROM trade_journal')
+        row = cur.fetchone()
+        return float(row[0] or 0)
 
 
 def get_setting(key, default=None):

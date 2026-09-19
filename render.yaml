@@ -15,8 +15,6 @@ services:
         value: 'false'
       - key: STRATEGY_MODE
         value: normal
-      - key: STRATEGY_MODE
-        value: normal
       - key: RUN_TRADER_IN_WEB
         value: 'false'
       - key: DEMO_TRADING_BUDGET
@@ -25,6 +23,10 @@ services:
         value: '20'
       - key: DEMO_RISK_PCT
         value: '2'
+      - key: BOT_BASE_CAPITAL
+        value: '10'
+      - key: PROFIT_LOCK_STEP
+        value: '5'
       - key: DATABASE_URL
         sync: false
 
