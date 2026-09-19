@@ -63,6 +63,19 @@ def test_demo_open_rejects_bad_geometry(monkeypatch):
     except ValueError as e:
         assert 'LONG requires' in str(e)
 
+def test_private_post_allows_unchanged_leverage_code(monkeypatch):
+    class Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {'retCode': 110043, 'retMsg': 'Set leverage has not been modified', 'result': {}}
+    monkeypatch.setattr(engine._http, 'post', lambda *a, **k: Resp())
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'DEMO_API_KEY', 'k')
+    monkeypatch.setattr(engine, 'DEMO_API_SECRET', 's')
+    out = engine.bybit_private_post('/v5/position/set-leverage', {'category':'linear','symbol':'BTCUSDT','buyLeverage':'10','sellLeverage':'10'}, allow_ret_codes={110043})
+    assert out == {}
+
+
 def test_demo_state_survives_closed_pnl_failure(monkeypatch):
     monkeypatch.setattr(engine, 'MODE', 'demo')
     monkeypatch.setattr(engine, 'DEMO_API_KEY', 'k')
@@ -151,3 +164,115 @@ def test_strategy_config_scales_gate_without_unbound_local(monkeypatch, tmp_path
     monkeypatch.setitem(app.strategy_state, 'mode', 'scalp')
     mode, interval, gate = trader._strategy_config()
     assert (mode, interval, gate) == ('scalp', '5', 55)
+
+
+def test_profit_lock_keeps_base_trading_capital_and_never_unlocks(monkeypatch, tmp_path):
+    import journal
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'capital.db'))
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'BOT_BASE_CAPITAL', 10.0)
+    monkeypatch.setattr(engine, 'PROFIT_LOCK_STEP', 5.0)
+    realized = {'value': 0.0}
+    monkeypatch.setattr(journal, 'realized_total', lambda mode=None: realized['value'])
+    first = engine._bot_capital_view()
+    assert first['trading_capital'] == 10.0 and first['locked_profit'] == 0.0
+    realized['value'] = 5.0
+    locked = engine._bot_capital_view()
+    assert locked['trading_capital'] == 10.0 and locked['locked_profit'] == 5.0
+    realized['value'] = 2.0
+    drawdown = engine._bot_capital_view()
+    assert drawdown['trading_capital'] == 7.0 and drawdown['locked_profit'] == 5.0
+    realized['value'] = 10.0
+    second_lock = engine._bot_capital_view()
+    assert second_lock['trading_capital'] == 10.0 and second_lock['locked_profit'] == 10.0
+
+
+def test_profit_lock_does_not_use_locked_profit_for_position_risk(monkeypatch, tmp_path):
+    import journal
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'capital-risk.db'))
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'BOT_BASE_CAPITAL', 10.0)
+    monkeypatch.setattr(engine, 'PROFIT_LOCK_STEP', 5.0)
+    realized = {'value': 0.0}
+    monkeypatch.setattr(journal, 'realized_total', lambda mode=None: realized['value'])
+    # Establish the baseline before the profit is generated.
+    engine._bot_capital_view()
+    realized['value'] = 5.0
+    monkeypatch.setattr(engine, '_demo_available_usdt', lambda: (1000.0, 1000.0, {}))
+    monkeypatch.setattr(engine, '_demo_positions', lambda: [])
+    monkeypatch.setattr(engine, '_symbol_rules', lambda symbol: (0.001, 0.001, 100.0))
+    qty, margin, available, equity, cap = engine._demo_risk_qty('BTCUSDT', 100.0, 99.0)
+    assert cap['trading_capital'] == 10.0 and cap['locked_profit'] == 5.0
+    assert margin <= 10.0 * 0.95 + 1e-9
+
+
+def test_news_filter_ignores_unconfirmed_headline(monkeypatch):
+    import news_engine
+    signal={'symbol':'SUIUSDT','decision':'OPEN LONG','direction':'LONG','blockers':[],'reasons':[]}
+    news={'btc_reaction':{'strength':'none','pct_15m':0,'pct_30m':0}}
+    news_engine._cache['items']=[{'id':'1','source':'CoinDesk','title':'SEC approves crypto ETF','summary':'','url':'','published_at':__import__('time').time()-5*60,'text':'SEC approves crypto ETF','kind':'crypto'}]
+    out=news_engine.apply_to_signal(signal,news,'scalp')
+    assert out['decision']=='OPEN LONG' and out['news_impact'] in ('medium','high')
+
+
+def test_news_filter_blocks_confirmed_high_impact_scalp(monkeypatch):
+    import news_engine, time
+    signal={'symbol':'SUIUSDT','decision':'OPEN LONG','direction':'LONG','blockers':[],'reasons':[]}
+    news={'btc_reaction':{'strength':'strong','pct_15m':0.8,'pct_30m':1.2}}
+    news_engine._cache['items']=[{'id':'2','source':'Federal Reserve','title':'Federal Reserve cuts rates','summary':'','url':'','published_at':time.time()-5*60,'text':'Federal Reserve cuts rates','kind':'macro'}]
+    out=news_engine.apply_to_signal(signal,news,'scalp')
+    assert out['decision']=='WAIT' and any('NEWS:' in x for x in out['blockers'])
+
+
+def test_news_filter_does_not_block_old_confirmed_event():
+    import news_engine, time
+    signal={'symbol':'SUIUSDT','decision':'OPEN LONG','direction':'LONG','blockers':[],'reasons':[]}
+    news={'btc_reaction':{'strength':'strong','pct_15m':0.8,'pct_30m':1.2}}
+    news_engine._cache['items']=[{'id':'3','source':'Federal Reserve','title':'Federal Reserve cuts rates','summary':'','url':'','published_at':time.time()-120*60,'text':'Federal Reserve cuts rates','kind':'macro'}]
+    out=news_engine.apply_to_signal(signal,news,'normal')
+    assert out['decision']=='OPEN LONG'
+
+
+def test_closed_pnl_fees_are_net_realized(monkeypatch, tmp_path):
+    import journal
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'fees.db'))
+    journal.sync_closed_pnl('demo', [{'orderId':'o1','symbol':'BTCUSDT','side':'Buy','qty':'1','avgEntryPrice':'100','avgExitPrice':'105','closedPnl':'5','openFee':'0.10','closeFee':'0.20','createdTime':'1','updatedTime':'2'}])
+    assert abs(journal.realized_total('demo') - 4.7) < 1e-9
+
+
+def test_capital_sync_imports_exchange_closed_pnl_automatically(monkeypatch, tmp_path):
+    import journal
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'auto-sync.db'))
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'BOT_BASE_CAPITAL', 10.0)
+    monkeypatch.setattr(engine, 'PROFIT_LOCK_STEP', 5.0)
+    monkeypatch.setattr(engine, '_demo_closed_pnl', lambda limit=100: [{'orderId':'auto1','symbol':'BTCUSDT','closedPnl':'5','openFee':'0','closeFee':'0','createdTime':'1','updatedTime':'2'}])
+    first = engine._bot_capital_view()
+    assert first['locked_profit'] == 5.0 and first['trading_capital'] == 10.0
+
+
+def test_news_confirmation_requires_direction_match(monkeypatch):
+    import news_engine, time
+    signal={'symbol':'SUIUSDT','decision':'OPEN LONG','direction':'LONG','blockers':[],'reasons':[]}
+    news={'btc_reaction':{'strength':'strong','pct_15m':-0.8,'pct_30m':-1.2,'direction':'bearish'}}
+    news_engine._cache['items']=[{'id':'dir1','source':'Federal Reserve','title':'Federal Reserve cuts rates','summary':'','url':'','published_at':time.time()-5*60,'text':'Federal Reserve cuts rates','kind':'macro'}]
+    out=news_engine.apply_to_signal(signal,news,'scalp')
+    assert out['decision']=='OPEN LONG' and out['news_market_confirmed'] is False
+
+
+def test_news_asset_matching_does_not_match_substring(monkeypatch):
+    import news_engine
+    item={'kind':'crypto','text':'This is a business update with no relevant asset ticker'}
+    rel, level, asset = news_engine._relevance(item, 'SUIUSDT')
+    assert asset == 'market'
+
+
+def test_news_source_status_degraded_when_all_feeds_fail(monkeypatch):
+    import news_engine
+    class Bad:
+        def get(self,*a,**k): raise RuntimeError('offline')
+    monkeypatch.setattr(news_engine, '_client', Bad())
+    news_engine._cache.update({'ts':0,'items':[],'sources':{}})
+    snap=news_engine.snapshot(force=True)
+    assert snap['status']=='degraded'
+    assert snap['sources'] and not any(v.get('ok') for v in snap['sources'].values())
