@@ -276,3 +276,32 @@ def test_news_source_status_degraded_when_all_feeds_fail(monkeypatch):
     snap=news_engine.snapshot(force=True)
     assert snap['status']=='degraded'
     assert snap['sources'] and not any(v.get('ok') for v in snap['sources'].values())
+
+def test_symbol_constraints_and_min_notional_risk_guard(monkeypatch):
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, '_demo_available_usdt', lambda: (1000.0, 1000.0, {}))
+    monkeypatch.setattr(engine, '_demo_positions', lambda: [])
+    monkeypatch.setattr(engine, '_bot_capital_view', lambda unrealized_pnl=0.0, reserved_margin=0.0: {'base_capital':10,'trading_capital':10,'locked_profit':0,'bot_equity':10,'bot_available_capital':10,'profit_lock_step':5})
+    monkeypatch.setattr(engine, 'instruments', lambda: [{'symbol':'XYZUSDT','lotSizeFilter':{'qtyStep':'1','minOrderQty':'1','maxOrderQty':'100','minNotionalValue':'5'},'leverageFilter':{'minLeverage':'1','maxLeverage':'5','leverageStep':'0.5'},'priceFilter':{'tickSize':'0.01'}}])
+    try:
+        engine._demo_risk_qty('XYZUSDT', 1.0, 0.9, requested_leverage=10, risk_pct=2)
+        assert False
+    except ValueError as e:
+        assert 'max is 5' in str(e)
+    try:
+        engine._demo_risk_qty('XYZUSDT', 1.0, 0.5, requested_leverage=5, risk_pct=2)
+        assert False
+    except ValueError as e:
+        assert 'minimum Bybit order value' in str(e)
+
+def test_full_market_scan_does_not_apply_24_cap(monkeypatch):
+    monkeypatch.setattr(engine, '_fast_market_universe', lambda: ([{'symbol':f'X{i}USDT','turnover24h':1000,'lastPrice':100,'spreadPct':0.01} for i in range(30)], {}))
+    # Fail before network/candle work; we only verify that full mode constructs all symbols.
+    seen=[]
+    def tech(symbol, interval, tm):
+        seen.append(symbol)
+        raise RuntimeError('stop')
+    monkeypatch.setattr(engine, '_technical_one', tech)
+    monkeypatch.setattr(engine, 'news_snapshot', lambda: {'status':'ok','impact':'low','items':[],'btc_reaction':{}})
+    out=engine.scan_market('15', 24, entry_threshold=70, strategy='normal', full_market=True)
+    assert len(set(seen)) == 30 and out['scan_policy']['full_market'] is True
