@@ -1,4 +1,4 @@
-# Bybit AI Agent — v5.10.1 DEMO
+# Bybit AI Agent — v5.11.1 DEMO
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -11,7 +11,7 @@ Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 - No averaging down and no martingale.
 
 
-## Protected trading capital — v5.10.1
+## Protected trading capital — v5.11.1
 - The bot has a separate virtual trading-capital ledger; the Bybit Demo wallet may contain much more money, but the bot cannot use more than its configured capital.
 - Default base trading capital: **$10** (`BOT_BASE_CAPITAL=10`).
 - Every **$5** of realized net profit is locked as protected profit (`PROFIT_LOCK_STEP=5`).
@@ -90,7 +90,7 @@ No API secrets belong in the repository.
 - Manual Market close: `POST /api/trade/close` with `{"symbol":"BTCUSDT"}`.
 - Live mode should be enabled only after Demo validation and an explicit production checklist.
 
-## Persistent trading process and journal — v5.10.1
+## Persistent trading process and journal — v5.11.1
 - Trading execution is separated from the web UI into `worker.py` / Render Background Worker.
 - The web service can run with `RUN_TRADER_IN_WEB=false`, preventing duplicate trading loops.
 - The worker is intended to remain running continuously; do not rely on a Free web service for 24/7 trading because Render Free web services spin down after 15 minutes without inbound traffic. See Render docs.
@@ -109,11 +109,11 @@ For persistent trade history, set DATABASE_URL to a Render Postgres database. If
 Entry gate relaxed: 4H/1H opposite trend, structure confirmation, spread/volatility, BTC regime, R:R/net edge and configured score remain hard blockers. VWAP, momentum, delta, OI and premium/discount are score evidence rather than mandatory binary gates.
 
 
-## v5.10.1
+## v5.11.1
 
 Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is treated as a benign no-op during leverage setup, so an otherwise valid DEMO order continues to `/v5/order/create`. Other leverage errors still block the trade.
 
-## v5.10.1 — News & Market-Reaction Filter
+## v5.11.1 — News & Market-Reaction Filter
 - Added `news_engine.py` with configurable RSS/Atom feeds (CoinDesk, Cointelegraph, Federal Reserve by default).
 - News is classified by crypto relevance, macro relevance, asset relevance, freshness and rule-based sentiment.
 - A headline alone never blocks a trade: high-impact blocking requires confirmed BTC/market reaction.
@@ -122,10 +122,21 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 - News items are attached to signal output for later journaling/analysis.
 
 
-## v5.10.1 fixes
+## v5.11.1 fixes
 - automatic exchange Closed PnL synchronization before protected-capital calculations
 - realized capital uses closed PnL net of Bybit open/close fees
 - news confirmation requires directional BTC reaction matching headline sentiment
 - asset news matching uses token/alias boundaries
 - news source health is surfaced as ok/degraded
 - removed duplicate Render capital environment variables
+
+
+## v5.11.1 — Full Market / Dual Strategy / Trade Monitor
+- Full active USDT linear perpetual universe is the default scan mode; 24-symbol cap is removed from the trading path.
+- NORMAL and SCALP can run together; same-symbol duplicate entries are resolved before order placement.
+- Configurable max positions, leverage mode, and total open-risk cap.
+- Pre-trade checks include Bybit minimum notional, quantity step/min/max, and per-symbol leverage limits.
+- Manual/demo order errors now explain when the exchange minimum would violate the configured risk budget.
+- Open-position monitor reassesses 5M momentum, ATR and news context without automatically overriding hard risk limits.
+- The UI shows direction arrows and full-market analysis mode.
+- This release remains Demo-first; live trading stays explicitly disarmed by default.

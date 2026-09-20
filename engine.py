@@ -29,9 +29,11 @@ RETRY_COUNT = 2
 PRIVATE_RETRY_COUNT = 2
 DEMO_ACCOUNT_CACHE_TTL = 8.0
 DEMO_CLOSED_PNL_CACHE_TTL = 30.0
-MAX_POSITIONS = 4
-RISK_PCT_DEFAULT = 2.0
-LEVERAGE = 10.0
+MAX_POSITIONS = int(os.getenv('MAX_POSITIONS', '8'))
+RISK_PCT_DEFAULT = float(os.getenv('RISK_PCT_DEFAULT', '2'))
+LEVERAGE = float(os.getenv('DEFAULT_LEVERAGE', '10'))
+LEVERAGE_MODE = os.getenv('LEVERAGE_MODE', 'fixed').lower()
+TOTAL_OPEN_RISK_PCT = float(os.getenv('TOTAL_OPEN_RISK_PCT', '8'))
 START_BALANCE = 10.0
 DEMO_TRADING_BUDGET = float(os.getenv('DEMO_TRADING_BUDGET', '100'))
 DEMO_MAX_DAILY_LOSS = float(os.getenv('DEMO_MAX_DAILY_LOSS', '20'))
@@ -44,9 +46,11 @@ PROFIT_LOCK_STEP = float(os.getenv('PROFIT_LOCK_STEP', '5'))
 
 # Scan budget: broad market discovery is one ticker request; expensive candle/microstructure
 # calls are reserved for a small ranked subset.
-TECH_CANDIDATES = 24
-DEEP_CANDIDATES = 12
-MICRO_CANDIDATES = 6
+TECH_CANDIDATES = int(os.getenv('TECH_CANDIDATES', '24'))
+DEEP_CANDIDATES = int(os.getenv('DEEP_CANDIDATES', '12'))
+MICRO_CANDIDATES = int(os.getenv('MICRO_CANDIDATES', '12'))
+FULL_MARKET_DEFAULT = os.getenv('FULL_MARKET_DEFAULT', 'true').lower() == 'true'
+FULL_MARKET_WORKERS = int(os.getenv('FULL_MARKET_WORKERS', '6'))
 INSTRUMENT_CACHE_TTL = 600.0
 DAILY_LOSS_LIMIT_PCT = 6.0
 MAX_CONSECUTIVE_LOSSES = 3
@@ -593,21 +597,27 @@ def _json_safe(value):
     return str(value)
 
 
-def scan_market(interval='15', limit_symbols=TECH_CANDIDATES, entry_threshold=ENTRY_SCORE_MIN, strategy='normal'):
+def scan_market(interval='15', limit_symbols=0, entry_threshold=ENTRY_SCORE_MIN, strategy='normal', full_market=None):
     if interval not in {'5', '15', '60'}:
         raise ValueError('interval must be 5, 15 or 60')
     universe, tm = _fast_market_universe()
     if not universe:
         return {'ok': True, 'mode':MODE, 'setup_interval':interval, 'universe_size':0, 'checked':0, 'technical_checked':0, 'deep_checked':0, 'micro_checked':0, 'results':[], 'failures':[], 'news': news_snapshot()}
 
-    # Always include BTC if it is a valid market; it is a regime filter, not a trade candidate priority.
-    top = universe[:TECH_CANDIDATES]
+    # Full-market mode is the default. A finite limit remains available for diagnostics,
+    # but it is no longer the trading architecture's hidden 24-symbol bottleneck.
+    if full_market is None:
+        full_market = FULL_MARKET_DEFAULT or not limit_symbols
+    if full_market:
+        top = list(universe)
+    else:
+        top = universe[:max(1, int(limit_symbols))]
     btc_row = next((x for x in universe if x['symbol']=='BTCUSDT'), None)
     if btc_row and all(x['symbol']!='BTCUSDT' for x in top):
-        top[-1] = btc_row
+        top.append(btc_row)
 
     preliminary=[]; failures=[]
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=max(2, FULL_MARKET_WORKERS)) as ex:
         futures={ex.submit(_technical_one,x['symbol'],interval,tm):x['symbol'] for x in top}
         for fut in as_completed(futures):
             s=futures[fut]
@@ -622,13 +632,15 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES, entry_threshold=EN
                     failures.append({'symbol':s,'stage':'technical','error':str(second_error),'retry_error':str(first_error)})
     preliminary.sort(key=lambda x:(x['hint'], x['turnover24h']), reverse=True)
 
-    # Deep pass on only the strongest technical candidates.
-    deep=preliminary[:DEEP_CANDIDATES]
+    # Full-market mode scores every technically scanned symbol. Expensive microstructure
+    # enrichment remains focused on the strongest signals so a whole-market scan does not
+    # hammer Bybit with thousands of orderbook/OI requests.
+    deep = preliminary if full_market else preliminary[:DEEP_CANDIDATES]
     btc_item=next((x for x in preliminary if x['symbol']=='BTCUSDT'),None)
-    if btc_item and all(x['symbol']!='BTCUSDT' for x in deep): deep[-1]=btc_item
+    if btc_item and all(x['symbol']!='BTCUSDT' for x in deep): deep = list(deep) + [btc_item]
     btc_context={'symbol':'BTCUSDT','bd':btc_item.get('htf_1d'),'b4':btc_item['htf_4h'],'b1':btc_item['htf_1h']} if btc_item else None
     scored=[]
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=max(2, FULL_MARKET_WORKERS)) as ex:
         futures={ex.submit(_deep_one,item,interval,btc_context,entry_threshold,strategy):item for item in deep}
         for fut in as_completed(futures):
             item=futures[fut]
@@ -638,7 +650,7 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES, entry_threshold=EN
                 failures.append({'symbol':item['symbol'],'stage':'deep','error':str(e)})
 
     scored.sort(key=lambda x:x['score'], reverse=True)
-    micro_targets=[x for x in scored if x['symbol']!='BTCUSDT'][:MICRO_CANDIDATES]
+    micro_targets=[x for x in scored if x['symbol']!='BTCUSDT' and float(x.get('score',0)) >= max(0, entry_threshold-10)][:MICRO_CANDIDATES]
     if not micro_targets and scored: micro_targets=scored[:MICRO_CANDIDATES]
     micro_map={}
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -675,9 +687,9 @@ def scan_market(interval='15', limit_symbols=TECH_CANDIDATES, entry_threshold=EN
             'deep_checked':len(deep),'deep_target':len(deep),'micro_checked':len(micro_map),'micro_target':len(micro_targets),
             'results':results,'failures':failures,
             'news': news,
-            'entry_threshold': int(entry_threshold), 'strategy': strategy, 'scan_policy':{'universe':'all active USDT linear perpetuals','technical_cap':TECH_CANDIDATES,
-                           'deep_cap':DEEP_CANDIDATES,'micro_cap':MICRO_CANDIDATES,
-                           'optimization':'persistent HTTP connections + bounded concurrency + retry/backoff + cached public data'}})
+            'entry_threshold': int(entry_threshold), 'strategy': strategy, 'scan_policy':{'universe':'all active USDT linear perpetuals','full_market':bool(full_market),
+                           'technical_cap':None if full_market else int(limit_symbols), 'deep_cap':None if full_market else DEEP_CANDIDATES, 'micro_cap':MICRO_CANDIDATES,
+                           'optimization':'full-market technical/deep pass with bounded concurrency; microstructure/news enrichment is event-focused'}})
 
 def _roll_day_locked():
     today = datetime.now(timezone.utc).date().isoformat()
@@ -906,32 +918,45 @@ def _demo_available_usdt():
     return float(available or 0), float(equity or 0), result
 
 
-def _demo_risk_qty(symbol, entry, sl):
+def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, return_details=False):
     available, equity, _ = _demo_available_usdt()
     budget_limit = DEMO_TRADING_BUDGET if MODE == 'demo' else LIVE_TRADING_BUDGET
-    risk_pct = DEMO_RISK_PCT if MODE == 'demo' else LIVE_RISK_PCT
+    risk_pct = float(DEMO_RISK_PCT if (risk_pct is None and MODE == 'demo') else LIVE_RISK_PCT if risk_pct is None else risk_pct)
     positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
     reserved_margin = sum(abs(float(x.get('positionIM') or 0)) for x in positions)
     unrealized = sum(float(x.get('unrealisedPnl') or 0) for x in positions)
     cap = _bot_capital_view(unrealized_pnl=unrealized, reserved_margin=reserved_margin)
-    # The Bybit wallet is only the funding source. New bot risk is capped by the
-    # separate virtual trading capital and cannot consume protected profit.
     budget = min(budget_limit, cap['bot_available_capital'], available)
     risk_cash = min(equity, budget) * risk_pct / 100
     dist = abs(entry - sl)
     if dist <= 0: raise ValueError('invalid stop distance')
+    leverage, constraints = _effective_leverage(symbol, requested_leverage)
+    qty_step, min_qty, max_qty = _symbol_rules(symbol)
     qty = risk_cash / dist
-    step, min_qty, max_qty = _symbol_rules(symbol)
-    qty = _round_step(qty, step) if step else qty
+    qty = _round_step(qty, qty_step) if qty_step else qty
     if max_qty > 0: qty = min(qty, max_qty)
-    margin = entry * qty / LEVERAGE
+    if constraints['min_notional'] > 0 and entry * qty < constraints['min_notional']:
+        min_qty_for_notional = constraints['min_notional'] / entry
+        qty_candidate = math.ceil(min_qty_for_notional / qty_step) * qty_step if qty_step else min_qty_for_notional
+        candidate_risk = qty_candidate * dist
+        if candidate_risk > risk_cash * 1.000001:
+            raise ValueError(f'minimum Bybit order value {constraints["min_notional"]:g} USDT requires risk ${candidate_risk:.2f}, above allowed ${risk_cash:.2f}')
+        qty = qty_candidate
+    margin = entry * qty / leverage
     if margin > budget * MAX_MARGIN_FRACTION:
-        qty = _round_step((budget * MAX_MARGIN_FRACTION * LEVERAGE) / entry, step) if step else (budget * MAX_MARGIN_FRACTION * LEVERAGE) / entry
-        margin = entry * qty / LEVERAGE
+        qty = _round_step((budget * MAX_MARGIN_FRACTION * leverage) / entry, qty_step) if qty_step else (budget * MAX_MARGIN_FRACTION * leverage) / entry
+        margin = entry * qty / leverage
+    actual_risk = qty * dist
+    if actual_risk > risk_cash * 1.000001:
+        raise ValueError(f'position risk ${actual_risk:.2f} exceeds allowed ${risk_cash:.2f}')
     if qty <= 0 or (min_qty > 0 and qty < min_qty):
-        raise ValueError(f'Demo position too small: available bot capital ${budget:.2f}')
-    return qty, margin, available, equity, cap
-
+        raise ValueError(f'position too small for available bot capital (${budget:.2f})')
+    total_open_risk = sum(abs(float(x.get('size') or 0)) * abs(float(x.get('avgPrice') or 0)) * (risk_pct / 100) for x in positions)
+    total_limit = min(equity, budget) * TOTAL_OPEN_RISK_PCT / 100
+    if total_open_risk + actual_risk > total_limit + 1e-9:
+        raise ValueError(f'total open risk ${total_open_risk + actual_risk:.2f} exceeds portfolio limit ${total_limit:.2f}')
+    details = (qty, margin, available, equity, cap, leverage, constraints, actual_risk)
+    return details if return_details else details[:5]
 
 
 def _demo_guard_status(equity=None):
@@ -955,7 +980,7 @@ def demo_open(d):
     positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
     if len(positions) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} demo positions')
     if any(x.get('symbol') == symbol for x in positions): raise ValueError('Position for this symbol already open')
-    qty, margin, available, equity, cap = _demo_risk_qty(symbol, entry, sl)
+    qty, margin, available, equity, cap, leverage, constraints, actual_risk = _demo_risk_qty(symbol, entry, sl, d.get('leverage'), d.get('risk_pct'), return_details=True)
     daily_loss, locked = _demo_guard_status(equity)
     limit = DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
     if locked: raise ValueError(f'Daily loss limit reached: ${daily_loss:.2f} / ${limit:.2f}')
@@ -964,7 +989,7 @@ def demo_open(d):
     # the order on it.
     bybit_private_post(
         '/v5/position/set-leverage',
-        {'category':'linear','symbol':symbol,'buyLeverage':str(int(LEVERAGE)),'sellLeverage':str(int(LEVERAGE))},
+        {'category':'linear','symbol':symbol,'buyLeverage':str(leverage),'sellLeverage':str(leverage)},
         allow_ret_codes={110043},
     )
     order = {
@@ -974,8 +999,49 @@ def demo_open(d):
     }
     result = bybit_private_post('/v5/order/create', order)
     _invalidate_demo_account_cache()
-    return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'bot_capital':cap,'order':result}
+    try:
+        from learning_engine import record_trade_meta
+        record_trade_meta({
+            'external_id': order['orderLinkId'], 'mode': MODE, 'symbol': symbol, 'side': side,
+            'strategy': d.get('strategy'), 'score': d.get('score'), 'risk_pct': d.get('risk_pct'),
+            'leverage': leverage, 'atr_pct': d.get('atr_pct'), 'market_regime': d.get('market_regime'),
+            'entry_timing': d.get('entry_timing'), 'news_impact': d.get('news_impact'),
+            'planned_risk': actual_risk
+        })
+    except Exception:
+        pass
+    return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'bot_capital':cap,'leverage':leverage,'actual_risk_usdt':actual_risk,'min_notional':constraints['min_notional'],'max_leverage':constraints['max_leverage'],'order':result}
 
+
+def trade_monitor_snapshot():
+    """Reassess currently open exchange positions without changing them.
+    This is an event-aware decision aid: it never overrides the hard risk limits.
+    """
+    if MODE not in ('demo','live'):
+        return {'ok': True, 'mode': 'paper', 'positions': []}
+    positions = exchange_positions()
+    news = news_snapshot()
+    out=[]
+    for p in positions:
+        symbol=p.get('symbol'); side='LONG' if p.get('side')=='Buy' else 'SHORT'
+        mark=float(p.get('markPrice') or p.get('avgPrice') or 0); avg=float(p.get('avgPrice') or 0)
+        upnl=float(p.get('unrealisedPnl') or 0); margin=abs(float(p.get('positionIM') or 0));
+        pnl_pct=(upnl/max(margin,1e-9))*100 if margin else 0.0
+        try:
+            k=klines(symbol,'5',60)
+            ff=frame_features(k)
+            ret_3=(float(k.close.iloc[-1])/float(k.close.iloc[-4])-1)*100 if len(k)>=4 else 0.0
+            atr_pct=float(ff.atr_pct.iloc[-1])
+            bias_5='LONG' if ret_3>0.15 else 'SHORT' if ret_3<-0.15 else 'NEUTRAL'
+        except Exception as e:
+            ret_3=0.0; atr_pct=0.0; bias_5='UNKNOWN'
+        aligned=(bias_5==side)
+        if pnl_pct >= 0.2 and aligned: decision='HOLD / TRAIL'
+        elif pnl_pct < 0 and aligned: decision='HOLD / REASSESS'
+        elif pnl_pct < -5 and not aligned: decision='EXIT REVIEW'
+        else: decision='REASSESS'
+        out.append({'symbol':symbol,'side':side,'avg_price':avg,'mark_price':mark,'unrealised_pnl':upnl,'pnl_on_margin_pct':round(pnl_pct,3),'momentum_5m_pct':round(ret_3,4),'momentum_bias_5m':bias_5,'atr_pct':round(atr_pct,3),'idea_aligned':aligned,'decision':decision,'news_status':news.get('status'),'news_impact':news.get('impact'),'hard_stop_note':'Hard capital/risk limits always override HOLD.'})
+    return {'ok':True,'mode':MODE,'positions':out,'checked_at':int(time.time()*1000)}
 
 def exchange_positions():
     return [x for x in bybit_private_get('/v5/position/list', {'category':'linear','settleCoin':'USDT'}).get('list', []) if float(x.get('size') or 0) > 0]
@@ -1110,6 +1176,42 @@ def _symbol_rules(symbol):
             lot = x.get('lotSizeFilter') or {}
             return float(lot.get('qtyStep') or 0), float(lot.get('minOrderQty') or 0), float(lot.get('maxOrderQty') or 0)
     return 0.0, 0.0, 0.0
+
+def _symbol_constraints(symbol):
+    # Exchange constraints used before an order is sent.
+    try:
+        source = instruments()
+    except Exception:
+        return {'min_notional': 0.0, 'min_leverage': 1.0, 'max_leverage': 0.0, 'leverage_step': 1.0, 'tick_size': 0.0}
+    for x in source:
+        if x.get('symbol') == symbol:
+            lot = x.get('lotSizeFilter') or {}
+            lev = x.get('leverageFilter') or {}
+            price = x.get('priceFilter') or {}
+            return {
+                'min_notional': float(lot.get('minNotionalValue') or 0),
+                'min_leverage': float(lev.get('minLeverage') or 1),
+                'max_leverage': float(lev.get('maxLeverage') or 0),
+                'leverage_step': float(lev.get('leverageStep') or 1),
+                'tick_size': float(price.get('tickSize') or 0),
+            }
+    return {'min_notional': 0.0, 'min_leverage': 1.0, 'max_leverage': 0.0, 'leverage_step': 1.0, 'tick_size': 0.0}
+
+def _effective_leverage(symbol, requested=None):
+    requested = float(requested if requested is not None else LEVERAGE)
+    if requested <= 0: raise ValueError('leverage must be positive')
+    c = _symbol_constraints(symbol)
+    max_lev = c['max_leverage']
+    if max_lev and requested > max_lev:
+        if LEVERAGE_MODE == 'auto':
+            requested = max_lev
+        else:
+            raise ValueError(f'leverage {requested:g}x is unavailable for {symbol}; Bybit max is {max_lev:g}x')
+    requested = max(c['min_leverage'], requested)
+    step = c['leverage_step'] or 1.0
+    requested = math.floor(requested / step) * step
+    if max_lev and requested > max_lev + 1e-9: requested = max_lev
+    return requested, c
 
 def paper_open(d):
     side = str(d['side']).upper(); symbol = str(d['symbol']).upper(); entry = float(d['entry']); sl = float(d['stop_loss']); tp = float(d['take_profit']); risk_pct = float(d.get('risk_pct', RISK_PCT_DEFAULT))

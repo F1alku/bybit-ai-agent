@@ -10,24 +10,26 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position
+from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position, trade_monitor_snapshot
 from journal import init_db, recent as journal_recent, sync_closed_pnl, get_setting, set_setting
+from learning_engine import build_learning_report, init_learning_db
 from news_engine import snapshot as news_snapshot
 from trader import run_auto_cycle
 
 AUTO_INTERVAL_SEC = 180
-SCAN_CANDIDATES = 24
+SCAN_CANDIDATES = 0  # 0 = full active Bybit USDT perpetual market
 auto_lock = threading.RLock()
 scan_lock = threading.Lock()
 scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
-strategy_state = {'mode': os.getenv('STRATEGY_MODE','normal').lower() if os.getenv('STRATEGY_MODE','normal').lower() in ('normal','scalp') else 'normal', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
+strategy_state = {'mode': os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
 auto_state = {'enabled': os.getenv('AUTO_ENABLED','false').lower() == 'true', 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0}
 
 @asynccontextmanager
 async def lifespan(_app):
     init_db()
+    init_learning_db()
     task = asyncio.create_task(_auto_loop()) if os.getenv('RUN_TRADER_IN_WEB','true').lower() == 'true' else None
     try:
         yield
@@ -39,7 +41,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.10.1', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='5.11.1', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -92,7 +94,8 @@ async def _auto_loop():
 
 class ScanRequest(BaseModel):
     interval: str = Field('15', pattern=r'^(5|15|60)$')
-    limit_symbols: int = Field(SCAN_CANDIDATES, ge=3, le=SCAN_CANDIDATES)
+    limit_symbols: int = Field(0, ge=0, le=2000)
+    full_market: bool = True
 
 class PaperOpenRequest(BaseModel):
     symbol: str
@@ -112,7 +115,8 @@ def health():
 
 @app.get('/api/strategy')
 def strategy_status():
-    return {'ok': True, 'strategy': strategy_state['mode'], 'label': 'SCALP' if strategy_state['mode']=='scalp' else 'NORMAL', 'normal_gate': strategy_state['normal_gate'], 'scalp_gate': strategy_state['scalp_gate']}
+    label = {'normal':'NORMAL','scalp':'SCALP','both':'NORMAL + SCALP'}.get(strategy_state['mode'], strategy_state['mode'].upper())
+    return {'ok': True, 'strategy': strategy_state['mode'], 'label': label, 'normal_gate': strategy_state['normal_gate'], 'scalp_gate': strategy_state['scalp_gate']}
 
 class StrategyGateRequest(BaseModel):
     mode: str = Field(..., pattern=r'^(normal|scalp)$')
@@ -128,8 +132,9 @@ def strategy_gate(req: StrategyGateRequest):
 @app.post('/api/strategy/toggle')
 def strategy_toggle():
     with auto_lock:
-        strategy_state['mode'] = 'scalp' if strategy_state['mode'] == 'normal' else 'normal'
-        auto_state['last_action'] = f"strategy switched to {strategy_state['mode'].upper()}"
+        cycle = {'normal':'scalp','scalp':'both','both':'normal'}
+        strategy_state['mode'] = cycle.get(strategy_state['mode'], 'both')
+        auto_state['last_action'] = f"strategy mode: {strategy_state['mode'].upper()}"
     return strategy_status()
 
 @app.get('/api/auto')
@@ -155,6 +160,11 @@ def news():
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+@app.get('/api/trading-config')
+def trading_config():
+    import engine
+    return {'ok': True, 'max_positions': engine.MAX_POSITIONS, 'default_leverage': engine.LEVERAGE, 'leverage_mode': engine.LEVERAGE_MODE, 'risk_pct': engine.RISK_PCT_DEFAULT, 'total_open_risk_pct': engine.TOTAL_OPEN_RISK_PCT, 'full_market': engine.FULL_MARKET_DEFAULT}
+
 @app.get('/api/markets')
 def markets():
     try: return {'ok': True, 'markets': market_snapshot(20)}
@@ -162,7 +172,22 @@ def markets():
 
 def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy):
     try:
-        result = scan_market(interval, limit_symbols, entry_threshold=entry_threshold, strategy=strategy)
+        if strategy == 'both':
+            normal = scan_market('15', limit_symbols, entry_threshold=entry_threshold, strategy='normal', full_market=True)
+            scalp = scan_market('5', limit_symbols, entry_threshold=int(strategy_state['scalp_gate']), strategy='scalp', full_market=True)
+            merged = {}
+            for x in normal.get('results', []):
+                y = dict(x); y['strategy'] = 'normal'; merged[(y.get('symbol'), 'normal')] = y
+            for x in scalp.get('results', []):
+                y = dict(x); y['strategy'] = 'scalp'; merged[(y.get('symbol'), 'scalp')] = y
+            result = dict(normal)
+            result['results'] = list(merged.values())
+            result['results'].sort(key=lambda x: float(x.get('score', 0)), reverse=True)
+            result['strategy'] = 'both'
+            result['dual_scan'] = {'normal': normal, 'scalp': scalp}
+            result['failures'] = normal.get('failures', []) + scalp.get('failures', [])
+        else:
+            result = scan_market(interval, limit_symbols, entry_threshold=entry_threshold, strategy=strategy, full_market=True)
         with scan_jobs_lock:
             scan_jobs[job_id] = {'status': 'done', 'result': result}
     except Exception as e:
@@ -228,6 +253,15 @@ def account():
     from engine import demo_account_state
     return demo_account_state()
 
+@app.get('/api/learning')
+def learning():
+    try:
+        if MODE in ('demo','live'):
+            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
+        return {'ok': True, **build_learning_report(1000)}
+    except Exception as e:
+        return {'ok': False, 'error': str(e), 'learning_enabled': True}
+
 @app.get('/api/journal')
 def journal():
     try:
@@ -245,6 +279,13 @@ def trade_open(req: PaperOpenRequest):
         return paper_open(req.model_dump())
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get('/api/trades/monitor')
+def trades_monitor():
+    try:
+        return trade_monitor_snapshot()
+    except Exception as e:
+        return {'ok': False, 'error': str(e), 'positions': []}
 
 @app.post('/api/trade/close')
 def trade_close(req: dict):
