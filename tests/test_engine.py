@@ -305,3 +305,37 @@ def test_full_market_scan_does_not_apply_24_cap(monkeypatch):
     monkeypatch.setattr(engine, 'news_snapshot', lambda: {'status':'ok','impact':'low','items':[],'btc_reaction':{}})
     out=engine.scan_market('15', 24, entry_threshold=70, strategy='normal', full_market=True)
     assert len(set(seen)) == 30 and out['scan_policy']['full_market'] is True
+
+
+def test_full_market_universe_keeps_thin_symbols(monkeypatch):
+    monkeypatch.setattr(engine, 'instruments', lambda: [
+        {'symbol':'BTCUSDT'}, {'symbol':'THINUSDT'}
+    ])
+    monkeypatch.setattr(engine, '_ticker_map', lambda: {
+        'BTCUSDT': {'symbol':'BTCUSDT','turnover24h':'1000','lastPrice':'100','bid1Price':'99.9','ask1Price':'100.1','price24hPcnt':'0.01'},
+        'THINUSDT': {'symbol':'THINUSDT','turnover24h':'0','lastPrice':'1','bid1Price':'0.98','ask1Price':'1.02','price24hPcnt':'-0.01'},
+    })
+    rows, _ = engine._fast_market_universe()
+    assert {x['symbol'] for x in rows} == {'BTCUSDT','THINUSDT'}
+
+
+def test_kline_cache_avoids_duplicate_http(monkeypatch):
+    engine._cache.clear()
+    calls=[]
+    def fake_get(path, params):
+        calls.append((path, tuple(sorted(params.items()))))
+        return {'list': [[str(i), '100','101','99','100','1000','100000'] for i in range(100,0,-1)]}
+    monkeypatch.setattr(engine, 'bybit_get', fake_get)
+    a=engine.klines('BTCUSDT','15',100)
+    b=engine.klines('BTCUSDT','15',100)
+    assert len(calls)==1 and len(a)==len(b)
+
+
+def test_portfolio_risk_uses_confirmed_stop(monkeypatch):
+    monkeypatch.setattr(engine, '_demo_available_usdt', lambda: (10.0, 10.0, {}))
+    monkeypatch.setattr(engine, '_demo_positions', lambda: [{'size':'0.1','avgPrice':'100','positionIM':'10','stopLoss':'99'}])
+    monkeypatch.setattr(engine, '_bot_capital_view', lambda unrealized_pnl=0, reserved_margin=0: {'bot_available_capital':10.0})
+    monkeypatch.setattr(engine, '_effective_leverage', lambda symbol, requested: (10.0, {'min_notional':0,'max_leverage':10}))
+    monkeypatch.setattr(engine, '_symbol_rules', lambda symbol: (0.001,0.001,100.0))
+    qty, margin, available, equity, cap, lev, constraints, actual = engine._demo_risk_qty('BTCUSDT',100,99,10,2,True)
+    assert actual == 0.2
