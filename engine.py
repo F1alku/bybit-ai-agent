@@ -49,6 +49,7 @@ PROFIT_LOCK_STEP = float(os.getenv('PROFIT_LOCK_STEP', '5'))
 TECH_CANDIDATES = int(os.getenv('TECH_CANDIDATES', '24'))
 DEEP_CANDIDATES = int(os.getenv('DEEP_CANDIDATES', '12'))
 MICRO_CANDIDATES = int(os.getenv('MICRO_CANDIDATES', '12'))
+FULL_MARKET_DEEP_CANDIDATES = int(os.getenv('FULL_MARKET_DEEP_CANDIDATES', '60'))
 FULL_MARKET_DEFAULT = os.getenv('FULL_MARKET_DEFAULT', 'true').lower() == 'true'
 FULL_MARKET_WORKERS = int(os.getenv('FULL_MARKET_WORKERS', '6'))
 INSTRUMENT_CACHE_TTL = 600.0
@@ -64,7 +65,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.10.1'}, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.11.2'}, limits=httpx.Limits(max_connections=40, max_keepalive_connections=20))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -235,6 +236,12 @@ def market_snapshot(limit=20):
     return rows[:cap]
 
 def klines(symbol, interval, limit=220):
+    # Shared TTL cache is critical because NORMAL and SCALP consume the same higher-timeframe data.
+    # The cache also prevents rapid UI polling from re-fetching identical candles.
+    key = ('klines', symbol, str(interval), int(limit))
+    cached = _cached(key)
+    if cached is not None:
+        return cached.copy(deep=True)
     rows = bybit_get('/v5/market/kline', {
         'category': 'linear', 'symbol': symbol, 'interval': str(interval), 'limit': min(int(limit), 1000)
     }).get('list', [])
@@ -246,7 +253,9 @@ def klines(symbol, interval, limit=220):
         df[c] = pd.to_numeric(df[c], errors='coerce')
     df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
     df = df.dropna().reset_index(drop=True)
-    return df.iloc[:-1].reset_index(drop=True)  # closed candles only
+    out = df.iloc[:-1].reset_index(drop=True)  # closed candles only
+    _put_cache(key, out)
+    return out.copy(deep=True)
 
 
 def open_interest(symbol, interval='15min', limit=10):
@@ -541,8 +550,9 @@ def _fast_market_universe():
             bid = float(x.get('bid1Price') or 0); ask = float(x.get('ask1Price') or 0)
             spread = ((ask-bid)/last*100) if last > 0 and ask >= bid > 0 else 999.0
             chg = abs(float(x.get('price24hPcnt') or 0))*100
-            # Broad discovery: exclude dead/obviously broken markets, but don't hard-cap by symbol.
-            if last <= 0 or turnover <= 0 or spread >= 1.0:
+            # Analyze every active USDT linear perpetual. Liquidity/spread are trade gates,
+            # not discovery filters; a thin market must remain visible to the analysis layer.
+            if last <= 0:
                 continue
             rows.append({'symbol': symbol, 'turnover24h': turnover, 'lastPrice': last,
                          'spreadPct': spread, 'absChange24h': chg,
@@ -569,7 +579,7 @@ def _technical_one(symbol, interval, tm):
     return {'symbol': symbol, 'price': float(tm[symbol].get('lastPrice') or z.close),
             'turnover24h': float(tm[symbol].get('turnover24h') or 0),
             'spreadPct': float(((float(tm[symbol].get('ask1Price') or 0)-float(tm[symbol].get('bid1Price') or 0))/max(float(tm[symbol].get('lastPrice') or 1),1e-9))*100),
-            'htf_1d': bd, 'htf_1d': bd, 'htf_4h': b4, 'htf_1h': b1, 'hint': hint, 'frames': frames}
+            'htf_1d': bd, 'htf_4h': b4, 'htf_1h': b1, 'hint': hint, 'frames': frames}
 
 
 def _deep_one(item, interval, btc_context, entry_threshold=ENTRY_SCORE_MIN, strategy='normal'):
@@ -632,10 +642,11 @@ def scan_market(interval='15', limit_symbols=0, entry_threshold=ENTRY_SCORE_MIN,
                     failures.append({'symbol':s,'stage':'technical','error':str(second_error),'retry_error':str(first_error)})
     preliminary.sort(key=lambda x:(x['hint'], x['turnover24h']), reverse=True)
 
-    # Full-market mode scores every technically scanned symbol. Expensive microstructure
-    # enrichment remains focused on the strongest signals so a whole-market scan does not
-    # hammer Bybit with thousands of orderbook/OI requests.
-    deep = preliminary if full_market else preliminary[:DEEP_CANDIDATES]
+    # Full-market means every active symbol gets a fast technical analysis. Deep analysis is
+    # intentionally bounded to the strongest candidates; otherwise hundreds of symbols x
+    # multi-timeframe REST calls make NORMAL+SCALP slow and can approach API limits.
+    deep_cap = FULL_MARKET_DEEP_CANDIDATES if full_market else DEEP_CANDIDATES
+    deep = preliminary[:max(1, deep_cap)]
     btc_item=next((x for x in preliminary if x['symbol']=='BTCUSDT'),None)
     if btc_item and all(x['symbol']!='BTCUSDT' for x in deep): deep = list(deep) + [btc_item]
     btc_context={'symbol':'BTCUSDT','bd':btc_item.get('htf_1d'),'b4':btc_item['htf_4h'],'b1':btc_item['htf_1h']} if btc_item else None
@@ -689,7 +700,7 @@ def scan_market(interval='15', limit_symbols=0, entry_threshold=ENTRY_SCORE_MIN,
             'news': news,
             'entry_threshold': int(entry_threshold), 'strategy': strategy, 'scan_policy':{'universe':'all active USDT linear perpetuals','full_market':bool(full_market),
                            'technical_cap':None if full_market else int(limit_symbols), 'deep_cap':None if full_market else DEEP_CANDIDATES, 'micro_cap':MICRO_CANDIDATES,
-                           'optimization':'full-market technical/deep pass with bounded concurrency; microstructure/news enrichment is event-focused'}})
+                           'optimization':'full-market fast technical pass; bounded deep candidates; shared TTL market-data cache; microstructure/news enrichment is event-focused'}})
 
 def _roll_day_locked():
     today = datetime.now(timezone.utc).date().isoformat()
@@ -951,7 +962,19 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
         raise ValueError(f'position risk ${actual_risk:.2f} exceeds allowed ${risk_cash:.2f}')
     if qty <= 0 or (min_qty > 0 and qty < min_qty):
         raise ValueError(f'position too small for available bot capital (${budget:.2f})')
-    total_open_risk = sum(abs(float(x.get('size') or 0)) * abs(float(x.get('avgPrice') or 0)) * (risk_pct / 100) for x in positions)
+    total_open_risk = 0.0
+    for x in positions:
+        q = abs(float(x.get('size') or 0))
+        ep = float(x.get('avgPrice') or 0)
+        slx = float(x.get('stopLoss') or 0)
+        if q <= 0 or ep <= 0:
+            continue
+        # Prefer the exchange-confirmed SL. If unavailable, do not pretend the risk is
+        # smaller than it is: use the configured per-trade risk against position notional.
+        if slx > 0:
+            total_open_risk += q * abs(ep - slx)
+        else:
+            total_open_risk += q * ep * (risk_pct / 100)
     total_limit = min(equity, budget) * TOTAL_OPEN_RISK_PCT / 100
     if total_open_risk + actual_risk > total_limit + 1e-9:
         raise ValueError(f'total open risk ${total_open_risk + actual_risk:.2f} exceeds portfolio limit ${total_limit:.2f}')
@@ -1002,11 +1025,11 @@ def demo_open(d):
     try:
         from learning_engine import record_trade_meta
         record_trade_meta({
-            'external_id': order['orderLinkId'], 'mode': MODE, 'symbol': symbol, 'side': side,
+            'external_id': order.get('orderLinkId') or order.get('orderId'), 'order_id': order.get('orderId'), 'order_link_id': order.get('orderLinkId'), 'mode': MODE, 'symbol': symbol, 'side': side,
             'strategy': d.get('strategy'), 'score': d.get('score'), 'risk_pct': d.get('risk_pct'),
             'leverage': leverage, 'atr_pct': d.get('atr_pct'), 'market_regime': d.get('market_regime'),
             'entry_timing': d.get('entry_timing'), 'news_impact': d.get('news_impact'),
-            'planned_risk': actual_risk
+            'planned_risk': actual_risk, 'entry_price': entry, 'stop_loss': sl, 'take_profit': tp
         })
     except Exception:
         pass

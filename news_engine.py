@@ -28,7 +28,7 @@ if _extra:
             NEWS_FEEDS.append(tuple(parts))
 
 _cache = {'ts': 0.0, 'items': [], 'sources': {}}
-_client = httpx.Client(timeout=NEWS_TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.10.1 NewsEngine'})
+_client = httpx.Client(timeout=NEWS_TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.11.2 NewsEngine'})
 
 HIGH_KEYWORDS = {
     'fed': 5, 'federal reserve': 5, 'interest rate': 5, 'rate decision': 5,

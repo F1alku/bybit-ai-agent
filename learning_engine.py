@@ -6,7 +6,7 @@ optional, human-reviewable recommendations.
 """
 import math
 import time
-from journal import _conn, _lock, init_db, recent
+from journal import _conn, _lock, init_db, recent, aliases_for_orders
 
 
 def init_learning_db():
@@ -27,6 +27,9 @@ def init_learning_db():
             entry_timing TEXT,
             news_impact TEXT,
             planned_risk REAL,
+            stop_loss REAL,
+            take_profit REAL,
+            entry_price REAL,
             captured_at REAL
         )''')
         cur.execute('''CREATE TABLE IF NOT EXISTS learning_insights (
@@ -34,6 +37,11 @@ def init_learning_db():
             value TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        for col, typ in [('stop_loss','REAL'),('take_profit','REAL'),('entry_price','REAL')]:
+            try:
+                cur.execute(f'ALTER TABLE learning_trade_meta ADD COLUMN {col} {typ}')
+            except Exception:
+                pass
 
 
 def record_trade_meta(meta):
@@ -49,24 +57,24 @@ def record_trade_meta(meta):
         float(meta.get('score') or 0), float(meta.get('risk_pct') or 0),
         float(meta.get('leverage') or 0), float(meta.get('atr_pct') or 0),
         str(meta.get('market_regime') or ''), str(meta.get('entry_timing') or ''),
-        str(meta.get('news_impact') or ''), float(meta.get('planned_risk') or 0), time.time()
+        str(meta.get('news_impact') or ''), float(meta.get('planned_risk') or 0), float(meta.get('stop_loss') or 0), float(meta.get('take_profit') or 0), float(meta.get('entry_price') or 0), time.time()
     )
     with _lock, _conn() as c:
         cur = c.cursor()
         if str(c.__class__.__module__).startswith('psycopg'):
             cur.execute('''INSERT INTO learning_trade_meta
-                (external_id,mode,symbol,side,strategy,score,risk_pct,leverage,atr_pct,market_regime,entry_timing,news_impact,planned_risk,captured_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                (external_id,mode,symbol,side,strategy,score,risk_pct,leverage,atr_pct,market_regime,entry_timing,news_impact,planned_risk,stop_loss,take_profit,entry_price,captured_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (external_id) DO UPDATE SET score=EXCLUDED.score,risk_pct=EXCLUDED.risk_pct,leverage=EXCLUDED.leverage,
                 atr_pct=EXCLUDED.atr_pct,market_regime=EXCLUDED.market_regime,entry_timing=EXCLUDED.entry_timing,
-                news_impact=EXCLUDED.news_impact,planned_risk=EXCLUDED.planned_risk''', fields)
+                news_impact=EXCLUDED.news_impact,planned_risk=EXCLUDED.planned_risk,stop_loss=EXCLUDED.stop_loss,take_profit=EXCLUDED.take_profit,entry_price=EXCLUDED.entry_price''', fields)
         else:
             cur.execute('''INSERT INTO learning_trade_meta
-                (external_id,mode,symbol,side,strategy,score,risk_pct,leverage,atr_pct,market_regime,entry_timing,news_impact,planned_risk,captured_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                (external_id,mode,symbol,side,strategy,score,risk_pct,leverage,atr_pct,market_regime,entry_timing,news_impact,planned_risk,stop_loss,take_profit,entry_price,captured_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(external_id) DO UPDATE SET score=excluded.score,risk_pct=excluded.risk_pct,leverage=excluded.leverage,
                 atr_pct=excluded.atr_pct,market_regime=excluded.market_regime,entry_timing=excluded.entry_timing,
-                news_impact=excluded.news_impact,planned_risk=excluded.planned_risk''', fields)
+                news_impact=excluded.news_impact,planned_risk=excluded.planned_risk,stop_loss=excluded.stop_loss,take_profit=excluded.take_profit,entry_price=excluded.entry_price''', fields)
     return True
 
 
@@ -127,12 +135,19 @@ def build_learning_report(limit=1000):
     # Contextual grouping is only possible when entry metadata exists.
     with _lock, _conn() as c:
         cur=c.cursor()
-        cur.execute('SELECT external_id,mode,symbol,side,strategy,score,risk_pct,leverage,atr_pct,market_regime,entry_timing,news_impact,planned_risk FROM learning_trade_meta')
-        meta={str(r[0]):dict(zip(['external_id','mode','symbol','side','strategy','score','risk_pct','leverage','atr_pct','market_regime','entry_timing','news_impact','planned_risk'],r)) for r in cur.fetchall()}
+        cur.execute('SELECT external_id,mode,symbol,side,strategy,score,risk_pct,leverage,atr_pct,market_regime,entry_timing,news_impact,planned_risk,stop_loss,take_profit,entry_price FROM learning_trade_meta')
+        meta={str(r[0]):dict(zip(['external_id','mode','symbol','side','strategy','score','risk_pct','leverage','atr_pct','market_regime','entry_timing','news_impact','planned_risk','stop_loss','take_profit','entry_price'],r)) for r in cur.fetchall()}
     enriched=[]
+    order_ids=[r.get('external_id') for r in rows]
+    aliases=aliases_for_orders(order_ids)
     for r in rows:
-        m=meta.get(str(r['external_id']))
-        if m: enriched.append({**r, **m})
+        key=str(r['external_id'])
+        m=meta.get(key)
+        if not m:
+            link=aliases.get(key)
+            if link:
+                m=meta.get(str(link))
+        if m: enriched.append({**r, **m, 'matched_via_alias': key not in meta})
     for key in ('strategy','side','market_regime','entry_timing','news_impact'):
         groups={}
         for r in enriched: groups.setdefault(r.get(key) or 'UNKNOWN',[]).append(r)

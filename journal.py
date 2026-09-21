@@ -78,6 +78,13 @@ def init_db():
             cur.execute('''CREATE TABLE IF NOT EXISTS agent_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
         else:
             cur.execute('''CREATE TABLE IF NOT EXISTS agent_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS trade_id_aliases (
+            order_id TEXT PRIMARY KEY,
+            order_link_id TEXT,
+            symbol TEXT,
+            created_ms BIGINT,
+            updated_ms BIGINT
+        )''')
 
 
 def upsert_closed_pnl(mode, item):
@@ -91,6 +98,8 @@ def upsert_closed_pnl(mode, item):
         int(item.get('createdTime') or 0), int(item.get('updatedTime') or 0),
         'bybit_closed_pnl', json.dumps(item, ensure_ascii=False, separators=(',', ':')), time.time()
     )
+    order_id = str(item.get('orderId') or '')
+    order_link_id = str(item.get('orderLinkId') or '')
     with _lock, _conn() as c:
         cur = c.cursor()
         if _is_pg():
@@ -108,6 +117,16 @@ def upsert_closed_pnl(mode, item):
                 pnl=excluded.pnl, exit_price=excluded.exit_price, updated_ms=excluded.updated_ms,
                 raw_json=excluded.raw_json, synced_at=excluded.synced_at''', row)
 
+        if order_id and order_link_id:
+            if _is_pg():
+                cur.execute('''INSERT INTO trade_id_aliases(order_id,order_link_id,symbol,created_ms,updated_ms)
+                    VALUES(%s,%s,%s,%s,%s) ON CONFLICT(order_id) DO UPDATE SET order_link_id=EXCLUDED.order_link_id, updated_ms=EXCLUDED.updated_ms''',
+                    (order_id, order_link_id, str(item.get('symbol') or ''), int(item.get('createdTime') or 0), int(item.get('updatedTime') or 0)))
+            else:
+                cur.execute('''INSERT INTO trade_id_aliases(order_id,order_link_id,symbol,created_ms,updated_ms)
+                    VALUES(?,?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET order_link_id=excluded.order_link_id, updated_ms=excluded.updated_ms''',
+                    (order_id, order_link_id, str(item.get('symbol') or ''), int(item.get('createdTime') or 0), int(item.get('updatedTime') or 0)))
+
 
 def sync_closed_pnl(mode, items):
     init_db()
@@ -119,6 +138,21 @@ def sync_closed_pnl(mode, items):
         except Exception:
             continue
     return count
+
+
+def aliases_for_orders(order_ids):
+    ids=[str(x) for x in (order_ids or []) if x]
+    if not ids: return {}
+    init_db()
+    with _lock, _conn() as c:
+        cur=c.cursor()
+        if _is_pg():
+            placeholders=','.join(['%s']*len(ids))
+            cur.execute(f'SELECT order_id,order_link_id FROM trade_id_aliases WHERE order_id IN ({placeholders})', tuple(ids))
+        else:
+            placeholders=','.join(['?']*len(ids))
+            cur.execute(f'SELECT order_id,order_link_id FROM trade_id_aliases WHERE order_id IN ({placeholders})', tuple(ids))
+        return {str(r[0]):str(r[1]) for r in cur.fetchall()}
 
 
 def recent(limit=100):

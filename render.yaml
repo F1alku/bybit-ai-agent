@@ -12,13 +12,13 @@ services:
       - key: LIVE_TRADING_ARMED
         value: 'false'
       - key: AUTO_ENABLED
-        value: 'true'
+        value: 'false'
       - key: STRATEGY_MODE
         value: both
       - key: RUN_TRADER_IN_WEB
         value: 'false'
       - key: DEMO_TRADING_BUDGET
-        value: '100'
+        value: '10'
       - key: MAX_POSITIONS
         value: '8'
       - key: DEFAULT_LEVERAGE
@@ -30,7 +30,9 @@ services:
       - key: FULL_MARKET_DEFAULT
         value: 'true'
       - key: FULL_MARKET_WORKERS
-        value: '4'
+        value: '6'
+      - key: FULL_MARKET_DEEP_CANDIDATES
+        value: '60'
       - key: DEMO_MAX_DAILY_LOSS
         value: '20'
       - key: DEMO_RISK_PCT
