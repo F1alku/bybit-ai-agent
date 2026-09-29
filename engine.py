@@ -1088,7 +1088,9 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
     qty_step, min_qty, max_qty = _symbol_rules(symbol)
     qty = risk_cash / dist
     qty = _round_step(qty, qty_step) if qty_step else qty
-    if max_qty > 0: qty = min(qty, max_qty)
+    if max_qty > 0:
+        qty = min(qty, max_qty)
+        qty = _round_step(qty, qty_step) if qty_step else qty
     if constraints['min_notional'] > 0 and entry * qty < constraints['min_notional']:
         min_qty_for_notional = constraints['min_notional'] / entry
         qty_candidate = math.ceil(min_qty_for_notional / qty_step) * qty_step if qty_step else min_qty_for_notional
@@ -1100,6 +1102,8 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
     if margin > budget * MAX_MARGIN_FRACTION:
         qty = _round_step((budget * MAX_MARGIN_FRACTION * leverage) / entry, qty_step) if qty_step else (budget * MAX_MARGIN_FRACTION * leverage) / entry
         margin = entry * qty / leverage
+    if max_qty > 0 and qty > max_qty + 1e-12:
+        raise ValueError(f'calculated quantity {qty:g} exceeds Bybit market max {max_qty:g}')
     actual_risk = qty * dist
     if actual_risk > risk_cash * 1.000001:
         raise ValueError(f'position risk ${actual_risk:.2f} exceeds allowed ${risk_cash:.2f}')
@@ -1411,6 +1415,13 @@ def _round_step(value, step):
     return math.floor(value / step) * step
 
 def _symbol_rules(symbol):
+    """Return qtyStep, minQty and the correct max quantity for Market orders.
+
+    Bybit exposes separate maximums for ordinary limit orders and market orders.
+    /v5/order/create in demo_open() uses orderType=Market, so maxMktOrderQty must
+    be enforced. Falling back to maxOrderQty keeps compatibility with older
+    instrument payloads.
+    """
     try:
         source = instruments()
     except Exception:
@@ -1418,7 +1429,12 @@ def _symbol_rules(symbol):
     for x in source:
         if x.get('symbol') == symbol:
             lot = x.get('lotSizeFilter') or {}
-            return float(lot.get('qtyStep') or 0), float(lot.get('minOrderQty') or 0), float(lot.get('maxOrderQty') or 0)
+            step = float(lot.get('qtyStep') or 0)
+            min_qty = float(lot.get('minOrderQty') or 0)
+            max_mkt = float(lot.get('maxMktOrderQty') or 0)
+            max_order = float(lot.get('maxOrderQty') or 0)
+            max_qty = max_mkt if max_mkt > 0 else max_order
+            return step, min_qty, max_qty
     return 0.0, 0.0, 0.0
 
 def _symbol_constraints(symbol):

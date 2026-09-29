@@ -211,3 +211,10 @@ The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-mar
 - Demo positions and server-side SL/TP live on Bybit and therefore survive a Render web-service restart.
 - The journal and learning memory survive Render restarts only when `DATABASE_URL` points to durable Postgres. Local `/tmp/bybit_agent.db` is a test fallback and is ephemeral on Render.
 - Startup synchronizes recent closed PnL and rebuilds the learning lesson cache before AUTO begins.
+
+
+### v6.1.9 — Market quantity execution fix
+For Bybit Market orders, the execution layer now uses `maxMktOrderQty` from
+`lotSizeFilter` (falling back to `maxOrderQty` only when the market-specific
+limit is unavailable). Quantity is re-normalized to `qtyStep` after the
+exchange maximum clamp and checked again before `/v5/order/create`.
