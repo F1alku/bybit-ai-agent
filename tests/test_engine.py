@@ -91,7 +91,7 @@ def test_demo_state_survives_closed_pnl_failure(monkeypatch):
 
 def test_private_get_retries_transient_http(monkeypatch):
     class Resp:
-        def __init__(self, status, payload): self.status_code=status; self._payload=payload
+        def __init__(self, status, payload): self.status_code=status; self._payload=payload; self.headers={}
         def raise_for_status(self):
             if self.status_code >= 400:
                 import httpx
@@ -373,3 +373,21 @@ def test_bot_deposit_cannot_be_lowered_below_open_stop_risk(monkeypatch, tmp_pat
         assert False
     except ValueError as e:
         assert 'open stop-risk' in str(e)
+
+
+def test_api_scan_respects_diagnostic_selector(monkeypatch):
+    calls=[]
+    def fake_scan(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {'ok':True,'universe_size':7,'checked':3,'technical_checked':3,'technical_target':3,'deep_checked':3,'micro_checked':3,'results':[],'failures':[],'scan_policy':{'full_market':kwargs.get('full_market')}}
+    monkeypatch.setattr(app, 'scan_market', fake_scan)
+    c=TestClient(app.app)
+    r=c.post('/api/scan', json={'interval':'15','limit_symbols':50,'full_market':True})
+    assert r.status_code==200
+    import time
+    for _ in range(30):
+        rr=c.get('/api/scan/'+r.json()['job_id'])
+        if rr.json().get('status')=='done':
+            break
+        time.sleep(0.02)
+    assert calls and calls[0][1]['full_market'] is False

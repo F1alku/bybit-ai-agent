@@ -10,3 +10,15 @@ def test_scan_market_with_mock(monkeypatch):
     monkeypatch.setattr(engine,'tickers',lambda:ticks); monkeypatch.setattr(engine,'instruments',lambda:[{'symbol':'BTCUSDT','contractType':'LinearPerpetual','quoteCoin':'USDT','settleCoin':'USDT'},{'symbol':'ETHUSDT','contractType':'LinearPerpetual','quoteCoin':'USDT','settleCoin':'USDT'}]); monkeypatch.setattr(engine,'klines',lambda s,i,limit=220:frame()); monkeypatch.setattr(engine,'flow_features',lambda s:{'oi_change_pct':0,'orderbook_imbalance':0,'trade_delta_pct':0,'funding_rate':0,'spread_pct':0.01})
     out=engine.scan_market('15',2)
     assert out['ok'] and out['checked']==2 and len(out['results'])==2
+
+
+def test_scan_market_diagnostic_limit_is_real(monkeypatch):
+    symbols = [f"C{i}USDT" for i in range(7)]
+    ticks=[{'symbol':s,'turnover24h':'1000','lastPrice':str(100+i),'bid1Price':str(99.99+i),'ask1Price':str(100.01+i),'price24hPcnt':'0.01'} for i,s in enumerate(symbols)]
+    instruments=[{'symbol':s,'contractType':'LinearPerpetual','quoteCoin':'USDT','settleCoin':'USDT'} for s in symbols]
+    monkeypatch.setattr(engine,'tickers',lambda:ticks); monkeypatch.setattr(engine,'instruments',lambda:instruments); monkeypatch.setattr(engine,'klines',lambda s,i,limit=220:frame()); monkeypatch.setattr(engine,'flow_features',lambda s:{'oi_change_pct':0,'orderbook_imbalance':0,'trade_delta_pct':0,'funding_rate':0,'spread_pct':0.01})
+    out=engine.scan_market('15',3,full_market=False)
+    assert out['universe_size']==7
+    assert out['technical_target']==3
+    assert out['scan_policy']['full_market'] is False
+
