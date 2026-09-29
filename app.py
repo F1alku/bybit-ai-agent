@@ -24,7 +24,7 @@ scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
 strategy_state = {'mode': os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
-auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('AUTO_ENABLED','false').lower() == 'true' else '0'))), 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0, 'last_duration_sec': None}
+auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('AUTO_ENABLED','false').lower() == 'true' else '0'))), 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0, 'last_duration_sec': None, 'pending': False}
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -41,7 +41,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.0.2', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.0.4', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -66,7 +66,8 @@ def _auto_iteration():
     # Never run an automatic scan concurrently with a manual scan.
     if not scan_lock.acquire(blocking=False):
         with auto_lock:
-            auto_state['last_action'] = 'auto skipped — scan already running'
+            auto_state['pending'] = True
+            auto_state['last_action'] = 'auto queued — waiting for current scan'
         return
     started = time.time()
     try:
@@ -124,7 +125,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.0.2', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.0.4', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -163,6 +164,8 @@ def auto_status():
 def auto_toggle():
     with auto_lock:
         auto_state['enabled'] = not auto_state['enabled']
+        if not auto_state['enabled']:
+            auto_state['pending'] = False
         set_setting('auto_enabled', '1' if auto_state['enabled'] else '0')
         auto_state['last_action'] = 'enabled by user' if auto_state['enabled'] else 'disabled by user'
     return auto_status()
@@ -203,11 +206,11 @@ def markets():
     try: return {'ok': True, 'markets': market_snapshot(20)}
     except Exception as e: raise HTTPException(status_code=502, detail=str(e))
 
-def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy):
+def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy, full_market):
     try:
         if strategy == 'both':
-            normal = scan_market('15', limit_symbols, entry_threshold=entry_threshold, strategy='normal', full_market=True)
-            scalp = scan_market('5', limit_symbols, entry_threshold=int(strategy_state['scalp_gate']), strategy='scalp', full_market=True)
+            normal = scan_market('15', limit_symbols, entry_threshold=entry_threshold, strategy='normal', full_market=full_market)
+            scalp = scan_market('5', limit_symbols, entry_threshold=int(strategy_state['scalp_gate']), strategy='scalp', full_market=full_market)
             merged = {}
             for x in normal.get('results', []):
                 y = dict(x); y['strategy'] = 'normal'; merged[(y.get('symbol'), 'normal')] = y
@@ -220,7 +223,7 @@ def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy):
             result['dual_scan'] = {'normal': normal, 'scalp': scalp}
             result['failures'] = normal.get('failures', []) + scalp.get('failures', [])
         else:
-            result = scan_market(interval, limit_symbols, entry_threshold=entry_threshold, strategy=strategy, full_market=True)
+            result = scan_market(interval, limit_symbols, entry_threshold=entry_threshold, strategy=strategy, full_market=full_market)
         with scan_jobs_lock:
             scan_jobs[job_id] = {'status': 'done', 'result': result}
     except Exception as e:
@@ -228,6 +231,13 @@ def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy):
             scan_jobs[job_id] = {'status': 'error', 'error': str(e), 'error_type': e.__class__.__name__}
     finally:
         scan_lock.release()
+        with auto_lock:
+            should_run_auto = bool(auto_state.get('enabled') and auto_state.get('pending'))
+            if should_run_auto:
+                auto_state['pending'] = False
+                auto_state['last_action'] = 'manual scan complete — starting queued AUTO'
+        if should_run_auto:
+            threading.Thread(target=_auto_iteration, daemon=True, name='auto-after-scan').start()
 
 @app.post('/api/scan')
 def scan(req: ScanRequest):
@@ -240,8 +250,14 @@ def scan(req: ScanRequest):
         if len(scan_jobs) > 20:
             for old_id in list(scan_jobs)[:-20]:
                 scan_jobs.pop(old_id, None)
+    # A finite selector (50/100) is explicitly diagnostic.  Never let the UI's
+    # historical full_market flag override that choice.  Full-market is only true
+    # when the user selected the 0/All option.
+    effective_full_market = bool(req.full_market and req.limit_symbols == 0)
+    with scan_jobs_lock:
+        scan_jobs[job_id]['full_market'] = effective_full_market
     try:
-        scan_executor.submit(_run_scan_job, job_id, req.interval, req.limit_symbols, strategy_state['scalp_gate'] if strategy_state['mode']=='scalp' else strategy_state['normal_gate'], strategy_state['mode'])
+        scan_executor.submit(_run_scan_job, job_id, req.interval, req.limit_symbols, strategy_state['scalp_gate'] if strategy_state['mode']=='scalp' else strategy_state['normal_gate'], strategy_state['mode'], effective_full_market)
     except Exception as e:
         scan_lock.release()
         with scan_jobs_lock:

@@ -138,7 +138,7 @@ def bybit_get(path, params):
             _pace_rest()
             r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
             if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRY_COUNT:
-                retry_after = r.headers.get('Retry-After')
+                retry_after = getattr(r, 'headers', {}).get('Retry-After')
                 try:
                     delay = max(0.5, min(5.0, float(retry_after))) if retry_after else 0.8 * (2 ** attempt)
                 except ValueError:
@@ -182,7 +182,7 @@ def bybit_private_post(path, body, allow_ret_codes=None):
             _pace_rest()
             r = _http.post(BASE + path, json=body, headers={**_auth_headers('POST', path, body), 'Content-Type':'application/json'})
             if r.status_code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
-                retry_after = r.headers.get('Retry-After')
+                retry_after = getattr(r, 'headers', {}).get('Retry-After')
                 try:
                     delay = max(0.5, min(5.0, float(retry_after))) if retry_after else 0.8 * (2 ** attempt)
                 except ValueError:
@@ -800,7 +800,7 @@ def bybit_private_get(path, params, retries=PRIVATE_RETRY_COUNT):
             _pace_rest()
             r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
             if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-                retry_after = r.headers.get('Retry-After')
+                retry_after = getattr(r, 'headers', {}).get('Retry-After')
                 try:
                     delay = max(0.5, min(5.0, float(retry_after))) if retry_after else 0.8 * (2 ** attempt)
                 except ValueError:

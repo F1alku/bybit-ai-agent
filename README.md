@@ -1,4 +1,4 @@
-# Bybit AI Agent — v6.0.2 Autonomous Demo Robot
+# Bybit AI Agent — v6.0.4 Diagnostic Scan + AUTO Queue Fix
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -11,7 +11,7 @@ Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 - No averaging down and no martingale.
 
 
-## Configurable bot capital — v6.0.2
+## Configurable bot capital — v6.0.4
 - The bot has a separate virtual trading-capital ledger; the Bybit Demo wallet may contain much more money, but the bot cannot use more than its configured capital.
 - Default bot deposit: **$10** (`BOT_BASE_CAPITAL=10`), but the user can change it from the UI/API without touching the Bybit wallet.
 - Every **$5** of realized net profit is locked by default (`PROFIT_LOCK_STEP=5`); the lock step is also configurable from the UI.
@@ -154,3 +154,12 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 - Order risk is calculated from Entry → Stop Loss and portfolio open-risk limits.
 - The current AI layer is explainable/rule-based market reasoning; an external LLM is not required for the core robot to run.
 - Production 24/7 topology remains Web Service + Background Worker + durable Postgres.
+
+
+## v6.0.4 fixes
+- Diagnostic selector 50/100 now actually limits the scan; the UI and API no longer force `full_market=true`.
+- The scan button/status now clearly show whether the run is full-market or diagnostic.
+- API health version bumped to 6.0.3.
+- Demo risk gate remains strict: minimum Bybit order requirements cannot silently increase the configured 2% risk.
+
+- If AUTO collides with a manual diagnostic scan, it is now queued and starts immediately after the manual scan releases the lock instead of simply disappearing for the next interval.
