@@ -47,18 +47,8 @@ BOT_BASE_CAPITAL = float(os.getenv('BOT_BASE_CAPITAL', '10000'))
 PROFIT_LOCK_STEP = float(os.getenv('PROFIT_LOCK_STEP', '5'))
 BOT_CAPITAL_MIN = float(os.getenv('BOT_CAPITAL_MIN', '1'))
 BOT_CAPITAL_MAX = float(os.getenv('BOT_CAPITAL_MAX', '1000000'))
-
-def _runtime_float_setting(key, default, minimum=0.0):
-    """Read a user-editable numeric setting from the persistent journal."""
-    try:
-        from journal import get_setting
-        value = float(get_setting(key, default))
-        if not math.isfinite(value) or value < minimum:
-            return float(default)
-        return value
-    except Exception:
-        return float(default)
-
+BOT_AVAILABLE_CAPITAL_MAX = float(os.getenv('BOT_AVAILABLE_CAPITAL_MAX', '1000000'))
+BOT_AVAILABLE_CAPITAL_MAX = float(os.getenv('BOT_AVAILABLE_CAPITAL_MAX', '1000000'))
 
 # Scan budget: broad market discovery is one ticker request; expensive candle/microstructure
 # calls are reserved for a small ranked subset.
@@ -70,7 +60,7 @@ FULL_MARKET_DEFAULT = os.getenv('FULL_MARKET_DEFAULT', 'true').lower() == 'true'
 FULL_MARKET_WORKERS = int(os.getenv('FULL_MARKET_WORKERS', '6'))
 INSTRUMENT_CACHE_TTL = 600.0
 DAILY_LOSS_LIMIT_PCT = float(os.getenv('DAILY_LOSS_LIMIT_PCT', '6'))
-MAX_CONSECUTIVE_LOSSES = int(os.getenv('MAX_CONSECUTIVE_LOSSES', '3'))
+MAX_CONSECUTIVE_LOSSES = 3
 LOSS_COOLDOWN_SEC = 30 * 60
 ENTRY_SCORE_MIN = 70
 ENTRY_RR_MIN = float(os.getenv('ENTRY_RR_MIN', '1.5'))
@@ -848,17 +838,16 @@ def bot_capital_config():
         'ok': True,
         'deposit': round(float(state['base_capital']), 6),
         'working_capital': round(float(state['trading_capital']), 6),
+        'available_capital_limit': round(float(state.get('available_capital_limit', 0.0)), 6),
         'locked_profit': round(float(state.get('locked_profit', 0.0)), 6),
         'profit_lock_step': round(float(get_setting('profit_lock_step', PROFIT_LOCK_STEP)), 6),
-        'working_capital_editable': True,
-        'available_capital_cap': round(float(get_setting('bot_available_capital_cap', state['trading_capital'])), 6),
         'min_deposit': round(float(BOT_CAPITAL_MIN), 6),
         'max_deposit': round(float(BOT_CAPITAL_MAX), 6),
         'mode': MODE,
         'journal_preserved': True,
     }
 
-def set_bot_capital(amount, profit_lock_step=None, working_capital=None, available_capital_cap=None):
+def set_bot_capital(amount, profit_lock_step=None, working_capital=None, available_capital_limit=None):
     """Change the virtual bot deposit without touching the exchange wallet or journal.
 
     A deposit change establishes a new virtual baseline. Existing closed-trade history
@@ -868,24 +857,26 @@ def set_bot_capital(amount, profit_lock_step=None, working_capital=None, availab
     amount = float(amount)
     if not math.isfinite(amount) or amount < BOT_CAPITAL_MIN or amount > BOT_CAPITAL_MAX:
         raise ValueError(f'bot deposit must be between ${BOT_CAPITAL_MIN:g} and ${BOT_CAPITAL_MAX:g}')
+    if working_capital is not None:
+        working = float(working_capital)
+        if not math.isfinite(working) or working <= 0 or working > BOT_CAPITAL_MAX:
+            raise ValueError(f'working capital must be between $0 and ${BOT_CAPITAL_MAX:g}')
+    else:
+        working = amount
+    if available_capital_limit is not None:
+        available_limit = float(available_capital_limit)
+        if not math.isfinite(available_limit) or available_limit < 0 or available_limit > BOT_AVAILABLE_CAPITAL_MAX:
+            raise ValueError(f'available capital limit must be between $0 and ${BOT_AVAILABLE_CAPITAL_MAX:g}')
+        if available_limit > working:
+            raise ValueError('available capital limit cannot exceed working capital')
+    else:
+        available_limit = float(_bot_capital_state().get('available_capital_limit', 0.0))
     if profit_lock_step is not None:
         step = float(profit_lock_step)
         if not math.isfinite(step) or step <= 0:
             raise ValueError('profit_lock_step must be positive')
     else:
         step = float(PROFIT_LOCK_STEP)
-    if working_capital is not None:
-        working = float(working_capital)
-        if not math.isfinite(working) or working <= 0 or working > amount:
-            raise ValueError('working_capital must be > 0 and <= bot deposit')
-    else:
-        working = amount
-    if available_capital_cap is not None:
-        available_cap = float(available_capital_cap)
-        if not math.isfinite(available_cap) or available_cap <= 0:
-            raise ValueError('available_capital_cap must be positive')
-    else:
-        available_cap = None
     # Check currently open exchange risk before lowering the virtual capital.
     open_risk = 0.0
     if MODE in ('demo', 'live'):
@@ -908,15 +899,14 @@ def set_bot_capital(amount, profit_lock_step=None, working_capital=None, availab
     # calculation from the newly selected deposit.
     state['base_capital'] = round(amount, 8)
     state['trading_capital'] = round(working, 8)
+    state['available_capital_limit'] = round(available_limit, 8)
     state['realized_baseline'] = round(current_realized, 8)
     state['realized_seen'] = round(current_realized, 8)
     state['last_capital_change_at'] = int(time.time() * 1000)
-    state['version'] = 2
+    state['version'] = 4
     set_setting('bot_capital_state', json.dumps(state, separators=(',', ':')))
     set_setting('bot_capital_deposit', amount)
     set_setting('profit_lock_step', step)
-    if available_cap is not None:
-        set_setting('bot_available_capital_cap', available_cap)
     return bot_capital_config()
 
 
@@ -928,7 +918,7 @@ def _bot_capital_state():
     if raw:
         try:
             state = json.loads(raw)
-            if state.get('version') in (1, 2, 3):
+            if state.get('version') in (1, 2, 3, 4):
                 # v6.1 standardizes the virtual Demo trading capital at $10,000.
                 # Migrate the old untouched $10 baseline once; afterwards the user
                 # controlled value is preserved. This prevents a restart/deploy from
@@ -950,6 +940,7 @@ def _bot_capital_state():
         'base_capital': round(base, 8),
         'trading_capital': round(base, 8),
         'locked_profit': 0.0,
+        'available_capital_limit': 0.0,
         'realized_baseline': round(baseline, 8),
         'realized_seen': round(baseline, 8),
         'last_lock_at': int(time.time() * 1000),
@@ -1002,6 +993,9 @@ def _bot_capital_view(unrealized_pnl=0.0, reserved_margin=0.0):
     # Unrealized gains do not increase risk budget; unrealized losses do reduce it.
     risk_equity = max(0.0, trading + min(0.0, float(unrealized_pnl)))
     available = max(0.0, risk_equity - float(reserved_margin))
+    available_limit = float(state.get('available_capital_limit', 0.0))
+    if available_limit > 0:
+        available = min(available, available_limit)
     return {
         'base_capital': round(float(state['base_capital']), 6),
         'trading_capital': round(trading, 6),
@@ -1084,8 +1078,7 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
     reserved_margin = sum(abs(float(x.get('positionIM') or 0)) for x in positions)
     unrealized = sum(float(x.get('unrealisedPnl') or 0) for x in positions)
     cap = _bot_capital_view(unrealized_pnl=unrealized, reserved_margin=reserved_margin)
-    available_cap_limit = _runtime_float_setting('bot_available_capital_cap', cap['bot_available_capital'], 0.01)
-    budget = min(cap['bot_available_capital'], available_cap_limit, available)
+    budget = min(cap['bot_available_capital'], available)
     risk_cash = min(equity, budget) * risk_pct / 100
     dist = abs(entry - sl)
     if dist <= 0: raise ValueError('invalid stop distance')
@@ -1138,7 +1131,7 @@ def _demo_guard_status(equity=None):
     closed = _demo_closed_pnl(100)
     snap = _demo_pnl_snapshot(wallet, positions, closed)
     loss = snap['daily_loss']
-    limit = _runtime_float_setting('demo_max_daily_loss', DEMO_MAX_DAILY_LOSS, 0.01) if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
+    limit = DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
     return loss, loss >= limit
 
 def demo_open(d):
@@ -1154,7 +1147,7 @@ def demo_open(d):
     if any(x.get('symbol') == symbol for x in positions): raise ValueError('Position for this symbol already open')
     qty, margin, available, equity, cap, leverage, constraints, actual_risk = _demo_risk_qty(symbol, entry, sl, d.get('leverage'), d.get('risk_pct'), return_details=True)
     daily_loss, locked = _demo_guard_status(equity)
-    limit = _runtime_float_setting('demo_max_daily_loss', DEMO_MAX_DAILY_LOSS, 0.01) if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
+    limit = DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
     if locked: raise ValueError(f'Daily loss limit reached: ${daily_loss:.2f} / ${limit:.2f}')
     # Set leverage first. Bybit returns 110043 when the requested leverage is
     # already set. That is a successful no-op for our purpose, so do not block
@@ -1273,10 +1266,9 @@ def demo_state():
     available_margin = float(acct.get('totalAvailableBalance') or 0)
     snap = _demo_pnl_snapshot(wallet, positions, closed)
     daily_loss = snap['daily_loss']
-    daily_loss_limit = _runtime_float_setting('demo_max_daily_loss', DEMO_MAX_DAILY_LOSS, 0.01) if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
-    locked = daily_loss >= daily_loss_limit
+    locked = daily_loss >= (DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS)
     cap = _bot_capital_view(unrealized_pnl=snap['unrealized_pnl'], reserved_margin=snap['reserved_margin'])
-    budget = cap['base_capital']
+    budget = cap['trading_capital']
     bot_available = min(cap['bot_available_capital'], available_margin)
     state = {
         'mode':MODE,'configured':True,'degraded':bool(warnings),'stale':False,'warnings':warnings,
@@ -1284,7 +1276,7 @@ def demo_state():
         'max_positions':MAX_POSITIONS,'trading_budget':budget,'bot_available_budget':round(bot_available, 6),
         'base_capital':cap['base_capital'],'trading_capital':cap['trading_capital'],'locked_profit':cap['locked_profit'],
         'bot_equity':cap['bot_equity'],'bot_available_capital':cap['bot_available_capital'],'profit_lock_step':cap['profit_lock_step'],
-        'reserved_margin':snap['reserved_margin'],'daily_loss_limit':daily_loss_limit,'daily_loss':daily_loss,
+        'reserved_margin':snap['reserved_margin'],'daily_loss_limit':(DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS),'daily_loss':daily_loss,
         'daily_pnl':snap['daily_pnl'],'realized_pnl_today':snap['realized_pnl_today'],
         'realized_pnl_7d':snap['realized_pnl_7d'],'unrealized_pnl':snap['unrealized_pnl'],
         'total_pnl_7d':snap['total_pnl_7d'],'equity':equity,'usdt_wallet_balance':usdt_wallet,
@@ -1397,7 +1389,7 @@ def paper_open(d):
     with _lock:
         _roll_day_locked()
         if _state['balance'] <= 0: raise ValueError('balance depleted')
-        if (_state['day_start_balance'] - _state['balance']) / max(_state['day_start_balance'], 1e-9) * 100 >= DAILY_LOSS_LIMIT_PCT: raise ValueError('daily loss limit reached')
+        if (_state['day_start_balance'] - _state['balance']) / max(_state['day_start_balance'], 1e-9) * 100 >= DAILY_LOSS_LIMIT_PCT: raise ValueError(f'daily loss limit reached: {DAILY_LOSS_LIMIT_PCT:g}%')
         if _state['loss_streak'] >= MAX_CONSECUTIVE_LOSSES: raise ValueError('loss streak lock active')
         if _state['last_loss_at'] and time.time() - _state['last_loss_at'] < LOSS_COOLDOWN_SEC: raise ValueError('cooldown active after loss')
         if len(_state['open']) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} open positions')

@@ -1,4 +1,4 @@
-# Bybit AI Agent — v6.1.5 AUTO Execution Fix + Full-Market Demo
+# Bybit AI Agent — v6.1.4 Manual Risk & Capital Controls
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -165,7 +165,7 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 - If AUTO collides with a manual diagnostic scan, it is now queued and starts immediately after the manual scan releases the lock instead of simply disappearing for the next interval.
 
 
-## v6.1.5
+## v6.1.4
 - Fixed Demo sync/open-position UI null-element bug.
 - Open positions now render with Trade Monitor decision, P&L, Entry/Mark, SL/TP, leverage and Market close.
 - Added persistent AUTO trading controls: max positions, risk %, leverage, total open risk %, and AUTO interval.
@@ -173,7 +173,7 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 - Leverage mode uses automatic per-symbol cap when the requested leverage exceeds Bybit limits.
 
 
-## v6.1.5 — AUTO Execution Fix
+## v6.1.3 — AUTO Execution Fix
 
 - `risk_pct` is configurable from 0 to 50% in the API/UI validation and paper engine.
 - AUTO in Demo/Live now reports explicit precheck blocks instead of a generic scan-complete message.
@@ -186,8 +186,18 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 
 ### Validation
 
-The v6.1.5 package was compiled and the existing test suite passed: **41 tests passed**.
+The v6.1.4 package was compiled and the full test suite passes: **43 tests passed**.
 
 ### Render
 
 The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-market scanning, 10x leverage, 8 max positions and a 60-second AUTO interval. API keys must be supplied as Render environment variables and are not included in the archive.
+
+
+## v6.1.4 — Manual risk and capital controls
+- Risk per trade is a free numeric setting from **0.01% to 50%**; it is no longer limited by a 5% UI selector.
+- Demo/Live daily loss limit is manually configurable in **USDT** instead of being fixed at $20.
+- Paper daily loss percentage is manually configurable.
+- Bot capital now supports manual **base deposit**, **working capital**, and an optional **available-to-bot capital limit**.
+- `0` for the available-to-bot limit means no additional cap; actual availability still accounts for reserved margin and unrealized losses.
+- These settings persist through the existing settings database and are applied on startup.
+- Existing NORMAL/SCALP scanner and AUTO logic was not intentionally changed by this release.
