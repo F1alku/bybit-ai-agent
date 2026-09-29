@@ -43,6 +43,8 @@ LIVE_MAX_DAILY_LOSS = float(os.getenv('LIVE_MAX_DAILY_LOSS', '20'))
 LIVE_RISK_PCT = float(os.getenv('LIVE_RISK_PCT', '2'))
 BOT_BASE_CAPITAL = float(os.getenv('BOT_BASE_CAPITAL', '10'))
 PROFIT_LOCK_STEP = float(os.getenv('PROFIT_LOCK_STEP', '5'))
+BOT_CAPITAL_MIN = float(os.getenv('BOT_CAPITAL_MIN', '1'))
+BOT_CAPITAL_MAX = float(os.getenv('BOT_CAPITAL_MAX', '1000000'))
 
 # Scan budget: broad market discovery is one ticker request; expensive candle/microstructure
 # calls are reserved for a small ranked subset.
@@ -65,7 +67,7 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/5.11.2'}, limits=httpx.Limits(max_connections=40, max_keepalive_connections=20))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/6.0.0'}, limits=httpx.Limits(max_connections=40, max_keepalive_connections=20))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -778,9 +780,71 @@ def bybit_private_get(path, params, retries=PRIVATE_RETRY_COUNT):
     raise last_error or RuntimeError('Bybit private request failed')
 
 def _capital_defaults():
-    base = max(0.01, float(BOT_BASE_CAPITAL))
+    base = min(max(float(BOT_BASE_CAPITAL), BOT_CAPITAL_MIN), BOT_CAPITAL_MAX)
     step = max(0.01, float(PROFIT_LOCK_STEP))
     return base, step
+
+def bot_capital_config():
+    from journal import get_setting
+    state = _sync_bot_capital()
+    return {
+        'ok': True,
+        'deposit': round(float(state['base_capital']), 6),
+        'working_capital': round(float(state['trading_capital']), 6),
+        'locked_profit': round(float(state.get('locked_profit', 0.0)), 6),
+        'profit_lock_step': round(float(get_setting('profit_lock_step', PROFIT_LOCK_STEP)), 6),
+        'min_deposit': round(float(BOT_CAPITAL_MIN), 6),
+        'max_deposit': round(float(BOT_CAPITAL_MAX), 6),
+        'mode': MODE,
+        'journal_preserved': True,
+    }
+
+def set_bot_capital(amount, profit_lock_step=None):
+    """Change the virtual bot deposit without touching the exchange wallet or journal.
+
+    A deposit change establishes a new virtual baseline. Existing closed-trade history
+    remains intact; already locked profit is preserved. Open positions are protected by
+    refusing a new baseline below their current stop-risk.
+    """
+    amount = float(amount)
+    if not math.isfinite(amount) or amount < BOT_CAPITAL_MIN or amount > BOT_CAPITAL_MAX:
+        raise ValueError(f'bot deposit must be between ${BOT_CAPITAL_MIN:g} and ${BOT_CAPITAL_MAX:g}')
+    if profit_lock_step is not None:
+        step = float(profit_lock_step)
+        if not math.isfinite(step) or step <= 0:
+            raise ValueError('profit_lock_step must be positive')
+    else:
+        step = float(PROFIT_LOCK_STEP)
+    # Check currently open exchange risk before lowering the virtual capital.
+    open_risk = 0.0
+    if MODE in ('demo', 'live'):
+        try:
+            for x in _demo_positions():
+                q = abs(float(x.get('size') or 0)); ep = float(x.get('avgPrice') or 0); sl = float(x.get('stopLoss') or 0)
+                if q > 0 and ep > 0 and sl > 0:
+                    open_risk += q * abs(ep - sl)
+        except Exception:
+            # If exchange sync is unavailable, do not silently accept a lower capital
+            # setting that could invalidate the risk budget.
+            if amount < float(_bot_capital_state().get('base_capital', amount)):
+                raise ValueError('cannot lower bot deposit while exchange positions cannot be synchronized')
+    if amount + 1e-9 < open_risk:
+        raise ValueError(f'bot deposit ${amount:.2f} is below current open stop-risk ${open_risk:.2f}')
+    from journal import get_setting, set_setting, realized_total
+    state = _bot_capital_state()
+    current_realized = realized_total(MODE) if MODE in ('demo', 'live') else float(state.get('realized_seen', 0.0))
+    # Preserve locked profit and all journal history, but start the virtual capital
+    # calculation from the newly selected deposit.
+    state['base_capital'] = round(amount, 8)
+    state['trading_capital'] = round(amount, 8)
+    state['realized_baseline'] = round(current_realized, 8)
+    state['realized_seen'] = round(current_realized, 8)
+    state['last_capital_change_at'] = int(time.time() * 1000)
+    state['version'] = 2
+    set_setting('bot_capital_state', json.dumps(state, separators=(',', ':')))
+    set_setting('bot_capital_deposit', amount)
+    set_setting('profit_lock_step', step)
+    return bot_capital_config()
 
 
 def _bot_capital_state():
@@ -791,7 +855,7 @@ def _bot_capital_state():
     if raw:
         try:
             state = json.loads(raw)
-            if state.get('version') == 1:
+            if state.get('version') in (1, 2):
                 return state
         except Exception:
             pass
@@ -830,7 +894,7 @@ def _sync_bot_capital():
         state['trading_capital'] = max(0.0, float(state['trading_capital']) + delta)
         state['realized_seen'] = current
     base = float(state['base_capital'])
-    step = max(0.01, float(PROFIT_LOCK_STEP))
+    step = max(0.01, float(get_setting('profit_lock_step', PROFIT_LOCK_STEP)))
     # Lock only realized net profit above the base. Losses reduce trading capital;
     # they never unlock previously protected profit.
     already_locked = float(state.get('locked_profit', 0.0))
@@ -849,6 +913,7 @@ def _sync_bot_capital():
 
 
 def _bot_capital_view(unrealized_pnl=0.0, reserved_margin=0.0):
+    from journal import get_setting
     state = _sync_bot_capital()
     trading = float(state['trading_capital'])
     # Unrealized gains do not increase risk budget; unrealized losses do reduce it.
@@ -860,7 +925,7 @@ def _bot_capital_view(unrealized_pnl=0.0, reserved_margin=0.0):
         'locked_profit': round(float(state['locked_profit']), 6),
         'bot_equity': round(risk_equity, 6),
         'bot_available_capital': round(available, 6),
-        'profit_lock_step': round(float(PROFIT_LOCK_STEP), 6),
+        'profit_lock_step': round(float(get_setting('profit_lock_step', PROFIT_LOCK_STEP)), 6),
     }
 
 

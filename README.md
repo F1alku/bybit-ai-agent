@@ -1,4 +1,4 @@
-# Bybit AI Agent — v5.11.1 DEMO
+# Bybit AI Agent — v6.0.0 Autonomous Demo Robot
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -11,10 +11,10 @@ Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 - No averaging down and no martingale.
 
 
-## Protected trading capital — v5.11.1
+## Configurable bot capital — v6.0.0
 - The bot has a separate virtual trading-capital ledger; the Bybit Demo wallet may contain much more money, but the bot cannot use more than its configured capital.
-- Default base trading capital: **$10** (`BOT_BASE_CAPITAL=10`).
-- Every **$5** of realized net profit is locked as protected profit (`PROFIT_LOCK_STEP=5`).
+- Default bot deposit: **$10** (`BOT_BASE_CAPITAL=10`), but the user can change it from the UI/API without touching the Bybit wallet.
+- Every **$5** of realized net profit is locked by default (`PROFIT_LOCK_STEP=5`); the lock step is also configurable from the UI.
 - Example: **$10 → $15** means **$5 locked** and **$10 remains available for trading**.
 - If trading capital later falls to **$7**, the bot can use only **$7**; it never replenishes the loss from locked profit.
 - Previously locked profit is never unlocked to increase trading risk.
@@ -23,10 +23,10 @@ Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
 ## Demo risk model
 - Bybit Demo base: `https://api-demo.bybit.com`.
-- Default Demo trading budget: **$100**.
+- Demo wallet balance and bot deposit are separate. The bot deposit is the risk budget; the Demo wallet can contain more funds.
 - Risk per trade: **2%**.
 - Leverage: **10x**.
-- Maximum simultaneous positions: **4**.
+- Maximum simultaneous positions: **8**.
 - Daily loss limit: **$20**.
 - AUTO is **OFF by default** in Demo.
 - Orders use server-side TP/SL.
@@ -73,6 +73,8 @@ No API secrets belong in the repository.
 - `POST /api/paper/update`
 - `POST /api/paper/reset`
 - `POST /api/paper/budget`
+- `GET /api/bot-capital`
+- `POST /api/bot-capital`
 
 ## Safety sequence
 1. Deploy with Demo mode and AUTO OFF.
@@ -140,3 +142,14 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 - Open-position monitor reassesses 5M momentum, ATR and news context without automatically overriding hard risk limits.
 - The UI shows direction arrows and full-market analysis mode.
 - This release remains Demo-first; live trading stays explicitly disarmed by default.
+
+
+## v6.0.0 Autonomous Robot Core
+- Configurable virtual bot deposit from the UI/API; changing it preserves the journal and does not transfer funds in Bybit.
+- Deposit changes are blocked if the new baseline is below current exchange stop-risk.
+- Full active USDT perpetual discovery remains separate from tradeability gates.
+- NORMAL + SCALP can operate from the same market scan architecture.
+- Demo execution remains off until the user explicitly enables AUTO.
+- Order risk is calculated from Entry → Stop Loss and portfolio open-risk limits.
+- The current AI layer is explainable/rule-based market reasoning; an external LLM is not required for the core robot to run.
+- Production 24/7 topology remains Web Service + Background Worker + durable Postgres.

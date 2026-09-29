@@ -18,7 +18,7 @@ services:
       - key: RUN_TRADER_IN_WEB
         value: 'false'
       - key: DEMO_TRADING_BUDGET
-        value: '10'
+        value: '100'
       - key: MAX_POSITIONS
         value: '8'
       - key: DEFAULT_LEVERAGE
@@ -41,6 +41,10 @@ services:
         value: '10'
       - key: PROFIT_LOCK_STEP
         value: '5'
+      - key: BOT_CAPITAL_MIN
+        value: '1'
+      - key: BOT_CAPITAL_MAX
+        value: '1000000'
       - key: DATABASE_URL
         sync: false
 
@@ -64,5 +68,23 @@ services:
         value: '20'
       - key: DEMO_RISK_PCT
         value: '2'
+      - key: BOT_BASE_CAPITAL
+        value: '10'
+      - key: PROFIT_LOCK_STEP
+        value: '5'
+      - key: BOT_CAPITAL_MIN
+        value: '1'
+      - key: BOT_CAPITAL_MAX
+        value: '1000000'
+      - key: MAX_POSITIONS
+        value: '8'
+      - key: DEFAULT_LEVERAGE
+        value: '10'
+      - key: LEVERAGE_MODE
+        value: fixed
+      - key: TOTAL_OPEN_RISK_PCT
+        value: '8'
+      - key: STRATEGY_MODE
+        value: both
       - key: DATABASE_URL
         sync: false

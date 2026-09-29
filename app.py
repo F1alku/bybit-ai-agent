@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position, trade_monitor_snapshot
+from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position, trade_monitor_snapshot, bot_capital_config, set_bot_capital
 from journal import init_db, recent as journal_recent, sync_closed_pnl, get_setting, set_setting
 from learning_engine import build_learning_report, init_learning_db
 from news_engine import snapshot as news_snapshot
@@ -41,7 +41,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='5.11.2', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.0.0', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -111,7 +111,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '5.11.2', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.0.0', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -159,6 +159,25 @@ def news():
         return news_snapshot(force=True)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+class BotCapitalRequest(BaseModel):
+    deposit: float = Field(gt=0)
+    profit_lock_step: float | None = Field(default=None, gt=0)
+
+@app.get('/api/bot-capital')
+def bot_capital():
+    try:
+        return bot_capital_config()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/api/bot-capital')
+def update_bot_capital(req: BotCapitalRequest):
+    try:
+        return set_bot_capital(req.deposit, req.profit_lock_step)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get('/api/trading-config')
 def trading_config():
