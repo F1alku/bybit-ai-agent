@@ -16,9 +16,9 @@ services:
       - key: STRATEGY_MODE
         value: both
       - key: RUN_TRADER_IN_WEB
-        value: 'false'
+        value: 'true'
       - key: DEMO_TRADING_BUDGET
-        value: '100'
+        value: '10'
       - key: MAX_POSITIONS
         value: '8'
       - key: DEFAULT_LEVERAGE
@@ -31,8 +31,10 @@ services:
         value: 'true'
       - key: FULL_MARKET_WORKERS
         value: '6'
-      - key: FULL_MARKET_DEEP_CANDIDATES
+      - key: AUTO_INTERVAL_SEC
         value: '60'
+      - key: FULL_MARKET_DEEP_CANDIDATES
+        value: '30'
       - key: DEMO_MAX_DAILY_LOSS
         value: '20'
       - key: DEMO_RISK_PCT
@@ -63,7 +65,9 @@ services:
       - key: AUTO_ENABLED
         value: 'false'
       - key: DEMO_TRADING_BUDGET
-        value: '100'
+        value: '10'
+      - key: AUTO_INTERVAL_SEC
+        value: '60'
       - key: DEMO_MAX_DAILY_LOSS
         value: '20'
       - key: DEMO_RISK_PCT

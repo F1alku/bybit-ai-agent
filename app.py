@@ -16,7 +16,7 @@ from learning_engine import build_learning_report, init_learning_db
 from news_engine import snapshot as news_snapshot
 from trader import run_auto_cycle
 
-AUTO_INTERVAL_SEC = 180
+AUTO_INTERVAL_SEC = int(os.getenv('AUTO_INTERVAL_SEC', '60'))
 SCAN_CANDIDATES = 0  # 0 = full active Bybit USDT perpetual market
 auto_lock = threading.RLock()
 scan_lock = threading.Lock()
@@ -24,7 +24,7 @@ scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
 strategy_state = {'mode': os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
-auto_state = {'enabled': os.getenv('AUTO_ENABLED','false').lower() == 'true', 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0}
+auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('AUTO_ENABLED','false').lower() == 'true' else '0'))), 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0, 'last_duration_sec': None}
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -41,7 +41,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.0.0', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.0.2', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -63,6 +63,12 @@ def _auto_iteration():
     with auto_lock:
         if not auto_state['enabled']:
             return
+    # Never run an automatic scan concurrently with a manual scan.
+    if not scan_lock.acquire(blocking=False):
+        with auto_lock:
+            auto_state['last_action'] = 'auto skipped — scan already running'
+        return
+    started = time.time()
     try:
         result, action, _ = run_auto_cycle()
         with auto_lock:
@@ -72,15 +78,20 @@ def _auto_iteration():
             auto_state['error'] = None
             if result is not None:
                 auto_state['last_success'] = time.time()
+            auto_state['last_duration_sec'] = round(time.time() - started, 2)
     except Exception as e:
         with auto_lock:
             auto_state['last_run'] = time.time()
             auto_state['last_action'] = 'scan error'
             auto_state['error'] = str(e)
+            auto_state['last_duration_sec'] = round(time.time() - started, 2)
+    finally:
+        scan_lock.release()
 
 
 async def _auto_loop():
     while True:
+        started = time.time()
         try:
             with auto_lock:
                 enabled = auto_state['enabled']
@@ -89,7 +100,9 @@ async def _auto_loop():
         except Exception as e:
             with auto_lock:
                 auto_state['error'] = str(e)
-        await asyncio.sleep(AUTO_INTERVAL_SEC)
+        # Interval is measured from the end of one cycle, not added on top of it.
+        elapsed = time.time() - started
+        await asyncio.sleep(max(1, AUTO_INTERVAL_SEC - elapsed))
 
 
 class ScanRequest(BaseModel):
@@ -111,7 +124,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.0.0', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.0.2', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -150,6 +163,7 @@ def auto_status():
 def auto_toggle():
     with auto_lock:
         auto_state['enabled'] = not auto_state['enabled']
+        set_setting('auto_enabled', '1' if auto_state['enabled'] else '0')
         auto_state['last_action'] = 'enabled by user' if auto_state['enabled'] else 'disabled by user'
     return auto_status()
 

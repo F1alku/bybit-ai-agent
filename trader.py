@@ -103,7 +103,7 @@ def run_auto_cycle():
     return result,action,None
 
 
-def worker_loop(interval=180):
+def worker_loop(interval=60):
     from journal import init_db
     init_db()
     enabled = os.getenv('AUTO_ENABLED','false').lower() == 'true'
@@ -115,5 +115,6 @@ def worker_loop(interval=180):
         try:
             run_auto_cycle()
         except Exception:
+            # Worker must stay alive; details are surfaced by the web/API worker.
             pass
         time.sleep(max(1, interval - (time.time() - started)))

@@ -11,4 +11,4 @@ if __name__ == '__main__':
             sync_closed_pnl(MODE, _demo_closed_pnl(100))
         except Exception:
             pass
-    worker_loop(180)
+    worker_loop(60)

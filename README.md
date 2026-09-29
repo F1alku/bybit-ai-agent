@@ -1,4 +1,4 @@
-# Bybit AI Agent — v6.0.0 Autonomous Demo Robot
+# Bybit AI Agent — v6.0.2 Autonomous Demo Robot
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -11,7 +11,7 @@ Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 - No averaging down and no martingale.
 
 
-## Configurable bot capital — v6.0.0
+## Configurable bot capital — v6.0.2
 - The bot has a separate virtual trading-capital ledger; the Bybit Demo wallet may contain much more money, but the bot cannot use more than its configured capital.
 - Default bot deposit: **$10** (`BOT_BASE_CAPITAL=10`), but the user can change it from the UI/API without touching the Bybit wallet.
 - Every **$5** of realized net profit is locked by default (`PROFIT_LOCK_STEP=5`); the lock step is also configurable from the UI.
@@ -51,7 +51,8 @@ Set these only as Render environment variables:
 - `BYBIT_MODE=demo`
 - `BYBIT_DEMO_API_KEY`
 - `BYBIT_DEMO_API_SECRET`
-- `AUTO_ENABLED=false`
+- `AUTO_ENABLED=false
+- `AUTO_INTERVAL_SEC=60``
 - `DEMO_TRADING_BUDGET=100`
 - `DEMO_MAX_DAILY_LOSS=20`
 - `DEMO_RISK_PCT=2`
@@ -144,7 +145,7 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 - This release remains Demo-first; live trading stays explicitly disarmed by default.
 
 
-## v6.0.0 Autonomous Robot Core
+## v6.0.2 Autonomous Robot Core
 - Configurable virtual bot deposit from the UI/API; changing it preserves the journal and does not transfer funds in Bybit.
 - Deposit changes are blocked if the new baseline is below current exchange stop-risk.
 - Full active USDT perpetual discovery remains separate from tradeability gates.

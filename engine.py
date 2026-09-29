@@ -24,7 +24,9 @@ LIVE_API_KEY = os.getenv('BYBIT_LIVE_API_KEY', '')
 LIVE_API_SECRET = os.getenv('BYBIT_LIVE_API_SECRET', '')
 LIVE_TRADING_ARMED = os.getenv('LIVE_TRADING_ARMED', 'false').lower() == 'true'
 TIMEOUT = 10.0
-CACHE_TTL = 20.0
+# Keep REST safely below endpoint/UID limits. The scanner should prefer cache/WS over bursts.
+CACHE_TTL = 60.0
+REST_MIN_INTERVAL_SEC = float(os.getenv('REST_MIN_INTERVAL_SEC', '0.12'))
 RETRY_COUNT = 2
 PRIVATE_RETRY_COUNT = 2
 DEMO_ACCOUNT_CACHE_TTL = 8.0
@@ -50,8 +52,8 @@ BOT_CAPITAL_MAX = float(os.getenv('BOT_CAPITAL_MAX', '1000000'))
 # calls are reserved for a small ranked subset.
 TECH_CANDIDATES = int(os.getenv('TECH_CANDIDATES', '24'))
 DEEP_CANDIDATES = int(os.getenv('DEEP_CANDIDATES', '12'))
-MICRO_CANDIDATES = int(os.getenv('MICRO_CANDIDATES', '12'))
-FULL_MARKET_DEEP_CANDIDATES = int(os.getenv('FULL_MARKET_DEEP_CANDIDATES', '60'))
+MICRO_CANDIDATES = int(os.getenv('MICRO_CANDIDATES', '8'))
+FULL_MARKET_DEEP_CANDIDATES = int(os.getenv('FULL_MARKET_DEEP_CANDIDATES', '30'))
 FULL_MARKET_DEFAULT = os.getenv('FULL_MARKET_DEFAULT', 'true').lower() == 'true'
 FULL_MARKET_WORKERS = int(os.getenv('FULL_MARKET_WORKERS', '6'))
 INSTRUMENT_CACHE_TTL = 600.0
@@ -67,6 +69,8 @@ PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
 
 _lock = threading.RLock()
+_rest_rate_lock = threading.Lock()
+_rest_last_request = 0.0
 _http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/6.0.0'}, limits=httpx.Limits(max_connections=40, max_keepalive_connections=20))
 _cache = {}
 _state = {
@@ -114,6 +118,16 @@ def _auth_headers(method, path, payload):
     sign = hmac.new(secret.encode(), (ts + key + recv + body).encode(), hashlib.sha256).hexdigest()
     return {'X-BAPI-API-KEY': key, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': recv, 'X-BAPI-SIGN': sign}
 
+def _pace_rest():
+    global _rest_last_request
+    with _rest_rate_lock:
+        now = time.monotonic()
+        wait = REST_MIN_INTERVAL_SEC - (now - _rest_last_request)
+        if wait > 0:
+            time.sleep(wait)
+        _rest_last_request = time.monotonic()
+
+
 def bybit_get(path, params):
     key = (MODE, path, tuple(sorted((str(k), str(v)) for k, v in params.items())))
     cached = _cached(key)
@@ -121,9 +135,15 @@ def bybit_get(path, params):
     last_error = None
     for attempt in range(RETRY_COUNT + 1):
         try:
+            _pace_rest()
             r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
             if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRY_COUNT:
-                time.sleep(0.45 * (2 ** attempt)); continue
+                retry_after = r.headers.get('Retry-After')
+                try:
+                    delay = max(0.5, min(5.0, float(retry_after))) if retry_after else 0.8 * (2 ** attempt)
+                except ValueError:
+                    delay = 0.8 * (2 ** attempt)
+                time.sleep(delay); continue
             r.raise_for_status()
             try:
                 j = r.json()
@@ -159,9 +179,15 @@ def bybit_private_post(path, body, allow_ret_codes=None):
     last_error = None
     for attempt in range(attempts):
         try:
+            _pace_rest()
             r = _http.post(BASE + path, json=body, headers={**_auth_headers('POST', path, body), 'Content-Type':'application/json'})
             if r.status_code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
-                time.sleep(0.45 * (2 ** attempt)); continue
+                retry_after = r.headers.get('Retry-After')
+                try:
+                    delay = max(0.5, min(5.0, float(retry_after))) if retry_after else 0.8 * (2 ** attempt)
+                except ValueError:
+                    delay = 0.8 * (2 ** attempt)
+                time.sleep(delay); continue
             r.raise_for_status()
             try:
                 j = r.json()
@@ -566,28 +592,33 @@ def _fast_market_universe():
 
 
 def _technical_one(symbol, interval, tm):
-    # Cheap technical pass: 4H + 1H + setup. 5M and microstructure wait for the shortlist.
-    setup = str(interval)
-    frames = {k: klines(symbol, k, 180) for k in sorted({'15', '60', '240', 'D', setup}, key=lambda x: ['5','15','60','240','D'].index(x))}
-    bd, b4, b1 = bias(frames['D']), bias(frames['240']), bias(frames['60'])
-    fsetup = frame_features(frames[setup]); z = fsetup.iloc[-1]
-    bull_sweep, bear_sweep = sweep(frames[setup])
-    bull_break, bear_break = structure_confirmation(frames[setup])
-    hi, lo = frames[setup].high.tail(50).max(), frames[setup].low.tail(50).min()
-    rng = max(float(hi-lo), 1e-12); pos = (float(z.close)-float(lo))/rng
-    long_hint = (10 if bd=='LONG' else 0) + (20 if b4=='LONG' else 0) + (15 if b1=='LONG' else 0) + (12 if bull_sweep else 0) + (10 if bull_break else 0) + (8 if pos <= .45 else 0)
-    short_hint = (10 if bd=='SHORT' else 0) + (20 if b4=='SHORT' else 0) + (15 if b1=='SHORT' else 0) + (12 if bear_sweep else 0) + (10 if bear_break else 0) + (8 if pos >= .55 else 0)
-    hint = max(long_hint, short_hint)
-    return {'symbol': symbol, 'price': float(tm[symbol].get('lastPrice') or z.close),
-            'turnover24h': float(tm[symbol].get('turnover24h') or 0),
-            'spreadPct': float(((float(tm[symbol].get('ask1Price') or 0)-float(tm[symbol].get('bid1Price') or 0))/max(float(tm[symbol].get('lastPrice') or 1),1e-9))*100),
-            'htf_1d': bd, 'htf_4h': b4, 'htf_1h': b1, 'hint': hint, 'frames': frames}
+    """Zero-candle fast pass for the whole market.
 
+    The full universe is analysed from the live ticker snapshot first. Expensive
+    multi-timeframe candles are reserved for the deep shortlist. This avoids
+    hundreds of REST kline requests every cycle and prevents HTTP 429 bursts.
+    """
+    row = tm.get(symbol) or {}
+    price = float(row.get('lastPrice') or 0)
+    change = float(row.get('price24hPcnt') or 0) * 100
+    turnover = float(row.get('turnover24h') or 0)
+    bid = float(row.get('bid1Price') or 0); ask = float(row.get('ask1Price') or 0)
+    spread = ((ask - bid) / price * 100) if price > 0 and ask >= bid > 0 else 999.0
+    # Directional hint is intentionally weak: it only ranks candidates for deep analysis.
+    hint = min(45.0, abs(change) * 2.0)
+    if turnover > 0:
+        hint += min(15.0, math.log10(turnover + 1.0))
+    return {
+        'symbol': symbol, 'price': price, 'turnover24h': turnover, 'spreadPct': spread,
+        'htf_1d': 'UNKNOWN', 'htf_4h': 'UNKNOWN', 'htf_1h': 'UNKNOWN',
+        'hint': round(hint, 3), 'frames': None, 'fast_change_24h': change,
+    }
 
 def _deep_one(item, interval, btc_context, entry_threshold=ENTRY_SCORE_MIN, strategy='normal'):
-    symbol=item['symbol']; frames=item['frames']
-    frames['5'] = klines(symbol, '5', 180)
-    # Reuse the 15/60/240 frames already fetched in the technical stage.
+    symbol=item['symbol']
+    # Deep analysis is bounded. Five timeframes are fetched once and then served
+    # from the shared 60s cache to both NORMAL and SCALP when the same symbol is used.
+    frames = {k: klines(symbol, k, 180) for k in ('5', '15', '60', '240', 'D')}
     return score(frames, interval, micro=None, live_price=item['price'], btc_context=btc_context, entry_threshold=entry_threshold, strategy=strategy)
 
 
@@ -651,7 +682,15 @@ def scan_market(interval='15', limit_symbols=0, entry_threshold=ENTRY_SCORE_MIN,
     deep = preliminary[:max(1, deep_cap)]
     btc_item=next((x for x in preliminary if x['symbol']=='BTCUSDT'),None)
     if btc_item and all(x['symbol']!='BTCUSDT' for x in deep): deep = list(deep) + [btc_item]
-    btc_context={'symbol':'BTCUSDT','bd':btc_item.get('htf_1d'),'b4':btc_item['htf_4h'],'b1':btc_item['htf_1h']} if btc_item else None
+    btc_context=None
+    if btc_item:
+        try:
+            btc_d = klines('BTCUSDT','D',180)
+            btc_4h = klines('BTCUSDT','240',180)
+            btc_1h = klines('BTCUSDT','60',180)
+            btc_context={'symbol':'BTCUSDT','bd':bias(btc_d),'b4':bias(btc_4h),'b1':bias(btc_1h)}
+        except Exception:
+            btc_context=None
     scored=[]
     with ThreadPoolExecutor(max_workers=max(2, FULL_MARKET_WORKERS)) as ex:
         futures={ex.submit(_deep_one,item,interval,btc_context,entry_threshold,strategy):item for item in deep}
@@ -678,9 +717,9 @@ def scan_market(interval='15', limit_symbols=0, entry_threshold=ENTRY_SCORE_MIN,
         s=x['symbol']
         if s in micro_map:
             try:
-                # Frames are still held in the deep item, avoiding duplicate candle calls.
                 item=next(i for i in deep if i['symbol']==s)
-                a=score(item['frames'],interval,micro=micro_map[s],live_price=item['price'],btc_context=btc_context,entry_threshold=entry_threshold,strategy=strategy)
+                frames={k: klines(s, k, 180) for k in ('5','15','60','240','D')}
+                a=score(frames,interval,micro=micro_map[s],live_price=item['price'],btc_context=btc_context,entry_threshold=entry_threshold,strategy=strategy)
                 a.update({'symbol':s,'turnover24h':x['turnover24h'],'enriched':True}); results.append(a)
                 continue
             except Exception as e: failures.append({'symbol':s,'stage':'rescore','error':str(e)})
@@ -758,9 +797,15 @@ def bybit_private_get(path, params, retries=PRIVATE_RETRY_COUNT):
     last_error = None
     for attempt in range(retries + 1):
         try:
+            _pace_rest()
             r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
             if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-                time.sleep(0.5 * (2 ** attempt)); continue
+                retry_after = r.headers.get('Retry-After')
+                try:
+                    delay = max(0.5, min(5.0, float(retry_after))) if retry_after else 0.8 * (2 ** attempt)
+                except ValueError:
+                    delay = 0.8 * (2 ** attempt)
+                time.sleep(delay); continue
             r.raise_for_status()
             try:
                 j = r.json()
@@ -996,13 +1041,12 @@ def _demo_available_usdt():
 
 def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, return_details=False):
     available, equity, _ = _demo_available_usdt()
-    budget_limit = DEMO_TRADING_BUDGET if MODE == 'demo' else LIVE_TRADING_BUDGET
     risk_pct = float(DEMO_RISK_PCT if (risk_pct is None and MODE == 'demo') else LIVE_RISK_PCT if risk_pct is None else risk_pct)
     positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
     reserved_margin = sum(abs(float(x.get('positionIM') or 0)) for x in positions)
     unrealized = sum(float(x.get('unrealisedPnl') or 0) for x in positions)
     cap = _bot_capital_view(unrealized_pnl=unrealized, reserved_margin=reserved_margin)
-    budget = min(budget_limit, cap['bot_available_capital'], available)
+    budget = min(cap['bot_available_capital'], available)
     risk_cash = min(equity, budget) * risk_pct / 100
     dist = abs(entry - sl)
     if dist <= 0: raise ValueError('invalid stop distance')
@@ -1190,9 +1234,9 @@ def demo_state():
     snap = _demo_pnl_snapshot(wallet, positions, closed)
     daily_loss = snap['daily_loss']
     locked = daily_loss >= (DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS)
-    budget = max(0.0, DEMO_TRADING_BUDGET if MODE == 'demo' else LIVE_TRADING_BUDGET)
     cap = _bot_capital_view(unrealized_pnl=snap['unrealized_pnl'], reserved_margin=snap['reserved_margin'])
-    bot_available = min(budget, cap['bot_available_capital'], available_margin)
+    budget = cap['base_capital']
+    bot_available = min(cap['bot_available_capital'], available_margin)
     state = {
         'mode':MODE,'configured':True,'degraded':bool(warnings),'stale':False,'warnings':warnings,
         'wallet':wallet,'positions':positions,'closed_pnl':closed[:20],
