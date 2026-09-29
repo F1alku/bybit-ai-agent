@@ -30,6 +30,13 @@ auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('
 async def lifespan(_app):
     init_db()
     init_learning_db()
+    # v6.1: first deployment can opt Demo AUTO into the persistent setting once.
+    # After the migration the user's manual ON/OFF choice remains authoritative.
+    if os.getenv('AUTO_ENABLED','false').lower() == 'true' and get_setting('auto_migrated_v61') != '1':
+        set_setting('auto_enabled', '1')
+        set_setting('auto_migrated_v61', '1')
+        with auto_lock:
+            auto_state['enabled'] = True
     task = asyncio.create_task(_auto_loop()) if os.getenv('RUN_TRADER_IN_WEB','true').lower() == 'true' else None
     try:
         yield
@@ -41,7 +48,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.0.4', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.0', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')

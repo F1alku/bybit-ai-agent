@@ -1,4 +1,4 @@
-# Bybit AI Agent — v6.0.4 Diagnostic Scan + AUTO Queue Fix
+# Bybit AI Agent — v6.1.0 UI Redesign + $10K Demo Capital + AUTO
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -13,7 +13,7 @@ Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
 ## Configurable bot capital — v6.0.4
 - The bot has a separate virtual trading-capital ledger; the Bybit Demo wallet may contain much more money, but the bot cannot use more than its configured capital.
-- Default bot deposit: **$10** (`BOT_BASE_CAPITAL=10`), but the user can change it from the UI/API without touching the Bybit wallet.
+- Default bot deposit: **$10,000** (`BOT_BASE_CAPITAL=10000`). v6.1 migrates the old untouched $10 baseline to $10,000 once., but the user can change it from the UI/API without touching the Bybit wallet.
 - Every **$5** of realized net profit is locked by default (`PROFIT_LOCK_STEP=5`); the lock step is also configurable from the UI.
 - Example: **$10 → $15** means **$5 locked** and **$10 remains available for trading**.
 - If trading capital later falls to **$7**, the bot can use only **$7**; it never replenishes the loss from locked profit.

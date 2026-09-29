@@ -12,13 +12,13 @@ services:
       - key: LIVE_TRADING_ARMED
         value: 'false'
       - key: AUTO_ENABLED
-        value: 'false'
+        value: 'true'
       - key: STRATEGY_MODE
         value: both
       - key: RUN_TRADER_IN_WEB
         value: 'true'
       - key: DEMO_TRADING_BUDGET
-        value: '10'
+        value: '10000'
       - key: MAX_POSITIONS
         value: '8'
       - key: DEFAULT_LEVERAGE
@@ -40,7 +40,7 @@ services:
       - key: DEMO_RISK_PCT
         value: '2'
       - key: BOT_BASE_CAPITAL
-        value: '10'
+        value: '10000'
       - key: PROFIT_LOCK_STEP
         value: '5'
       - key: BOT_CAPITAL_MIN
@@ -65,7 +65,7 @@ services:
       - key: AUTO_ENABLED
         value: 'false'
       - key: DEMO_TRADING_BUDGET
-        value: '10'
+        value: '10000'
       - key: AUTO_INTERVAL_SEC
         value: '60'
       - key: DEMO_MAX_DAILY_LOSS
@@ -73,7 +73,7 @@ services:
       - key: DEMO_RISK_PCT
         value: '2'
       - key: BOT_BASE_CAPITAL
-        value: '10'
+        value: '10000'
       - key: PROFIT_LOCK_STEP
         value: '5'
       - key: BOT_CAPITAL_MIN

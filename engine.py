@@ -37,13 +37,13 @@ LEVERAGE = float(os.getenv('DEFAULT_LEVERAGE', '10'))
 LEVERAGE_MODE = os.getenv('LEVERAGE_MODE', 'fixed').lower()
 TOTAL_OPEN_RISK_PCT = float(os.getenv('TOTAL_OPEN_RISK_PCT', '8'))
 START_BALANCE = 10.0
-DEMO_TRADING_BUDGET = float(os.getenv('DEMO_TRADING_BUDGET', '100'))
+DEMO_TRADING_BUDGET = float(os.getenv('DEMO_TRADING_BUDGET', '10000'))
 DEMO_MAX_DAILY_LOSS = float(os.getenv('DEMO_MAX_DAILY_LOSS', '20'))
 DEMO_RISK_PCT = float(os.getenv('DEMO_RISK_PCT', '2'))
 LIVE_TRADING_BUDGET = float(os.getenv('LIVE_TRADING_BUDGET', '100'))
 LIVE_MAX_DAILY_LOSS = float(os.getenv('LIVE_MAX_DAILY_LOSS', '20'))
 LIVE_RISK_PCT = float(os.getenv('LIVE_RISK_PCT', '2'))
-BOT_BASE_CAPITAL = float(os.getenv('BOT_BASE_CAPITAL', '10'))
+BOT_BASE_CAPITAL = float(os.getenv('BOT_BASE_CAPITAL', '10000'))
 PROFIT_LOCK_STEP = float(os.getenv('PROFIT_LOCK_STEP', '5'))
 BOT_CAPITAL_MIN = float(os.getenv('BOT_CAPITAL_MIN', '1'))
 BOT_CAPITAL_MAX = float(os.getenv('BOT_CAPITAL_MAX', '1000000'))
@@ -900,7 +900,17 @@ def _bot_capital_state():
     if raw:
         try:
             state = json.loads(raw)
-            if state.get('version') in (1, 2):
+            if state.get('version') in (1, 2, 3):
+                # v6.1 standardizes the virtual Demo trading capital at $10,000.
+                # Migrate the old untouched $10 baseline once; afterwards the user
+                # controlled value is preserved. This prevents a restart/deploy from
+                # bringing the bot back to the old $10 default.
+                if state.get('version') in (1, 2) and float(state.get('base_capital', 0) or 0) == 10.0 and BOT_BASE_CAPITAL >= 10000:
+                    state['base_capital'] = round(min(max(float(BOT_BASE_CAPITAL), BOT_CAPITAL_MIN), BOT_CAPITAL_MAX), 8)
+                    state['trading_capital'] = state['base_capital']
+                    state['version'] = 3
+                    state['last_capital_change_at'] = int(time.time() * 1000)
+                    set_setting('bot_capital_state', json.dumps(state, separators=(',', ':')))
                 return state
         except Exception:
             pass
