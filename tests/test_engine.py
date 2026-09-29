@@ -339,3 +339,37 @@ def test_portfolio_risk_uses_confirmed_stop(monkeypatch):
     monkeypatch.setattr(engine, '_symbol_rules', lambda symbol: (0.001,0.001,100.0))
     qty, margin, available, equity, cap, lev, constraints, actual = engine._demo_risk_qty('BTCUSDT',100,99,10,2,True)
     assert actual == 0.2
+
+def test_bot_deposit_can_be_changed_without_deleting_journal(monkeypatch, tmp_path):
+    import journal
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'bot-capital.db'))
+    monkeypatch.setattr(engine, 'MODE', 'paper')
+    monkeypatch.setattr(engine, 'BOT_BASE_CAPITAL', 10.0)
+    monkeypatch.setattr(engine, 'BOT_CAPITAL_MIN', 1.0)
+    monkeypatch.setattr(engine, 'BOT_CAPITAL_MAX', 100000.0)
+    monkeypatch.setattr(engine, 'PROFIT_LOCK_STEP', 5.0)
+    first = engine.bot_capital_config()
+    assert first['deposit'] == 10.0
+    changed = engine.set_bot_capital(100.0, 25.0)
+    assert changed['deposit'] == 100.0
+    assert changed['working_capital'] == 100.0
+    assert changed['profit_lock_step'] == 25.0
+    # Re-read from persistent settings: the new deposit survives a process restart.
+    engine._cache.clear()
+    again = engine.bot_capital_config()
+    assert again['deposit'] == 100.0 and again['working_capital'] == 100.0
+
+
+def test_bot_deposit_cannot_be_lowered_below_open_stop_risk(monkeypatch, tmp_path):
+    import journal
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'bot-capital-risk.db'))
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'BOT_BASE_CAPITAL', 100.0)
+    monkeypatch.setattr(engine, 'BOT_CAPITAL_MIN', 1.0)
+    monkeypatch.setattr(engine, 'BOT_CAPITAL_MAX', 100000.0)
+    monkeypatch.setattr(engine, '_demo_positions', lambda: [{'size':'1','avgPrice':'100','stopLoss':'80'}])
+    try:
+        engine.set_bot_capital(10.0)
+        assert False
+    except ValueError as e:
+        assert 'open stop-risk' in str(e)
