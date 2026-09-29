@@ -279,6 +279,7 @@ def test_news_source_status_degraded_when_all_feeds_fail(monkeypatch):
 
 def test_symbol_constraints_and_min_notional_risk_guard(monkeypatch):
     monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'LEVERAGE_MODE', 'fixed')
     monkeypatch.setattr(engine, '_demo_available_usdt', lambda: (1000.0, 1000.0, {}))
     monkeypatch.setattr(engine, '_demo_positions', lambda: [])
     monkeypatch.setattr(engine, '_bot_capital_view', lambda unrealized_pnl=0.0, reserved_margin=0.0: {'base_capital':10,'trading_capital':10,'locked_profit':0,'bot_equity':10,'bot_available_capital':10,'profit_lock_step':5})
@@ -391,3 +392,18 @@ def test_api_scan_respects_diagnostic_selector(monkeypatch):
             break
         time.sleep(0.02)
     assert calls and calls[0][1]['full_market'] is False
+
+
+def test_trading_config_api_persists_and_applies(monkeypatch, tmp_path):
+    import journal
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'trading.db'))
+    import engine, app
+    original = (engine.MAX_POSITIONS, engine.RISK_PCT_DEFAULT, engine.LEVERAGE, engine.TOTAL_OPEN_RISK_PCT)
+    c = TestClient(app.app)
+    r = c.post('/api/trading-config', json={'max_positions': 6, 'risk_pct': 1.5, 'leverage': 25, 'total_open_risk_pct': 7.5, 'auto_interval_sec': 90})
+    assert r.status_code == 200
+    j = r.json()
+    assert j['max_positions'] == 6 and j['risk_pct'] == 1.5 and j['default_leverage'] == 25 and j['total_open_risk_pct'] == 7.5 and j['auto_interval_sec'] == 90
+    assert engine.MAX_POSITIONS == 6 and engine.RISK_PCT_DEFAULT == 1.5 and engine.LEVERAGE == 25 and engine.TOTAL_OPEN_RISK_PCT == 7.5
+    assert journal.get_setting('max_positions') == '6' and journal.get_setting('risk_pct') == '1.5'
+    engine.MAX_POSITIONS, engine.RISK_PCT_DEFAULT, engine.LEVERAGE, engine.TOTAL_OPEN_RISK_PCT = original
