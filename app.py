@@ -35,6 +35,9 @@ def _apply_trading_settings():
     engine.LEVERAGE = float(get_setting('leverage', engine.LEVERAGE))
     engine.LEVERAGE_MODE = 'auto'
     engine.TOTAL_OPEN_RISK_PCT = float(get_setting('total_open_risk_pct', engine.TOTAL_OPEN_RISK_PCT))
+    engine.MAX_MARGIN_FRACTION = float(get_setting('max_margin_fraction', engine.MAX_MARGIN_FRACTION))
+    engine.DAILY_LOSS_LIMIT_PCT = float(get_setting('daily_loss_limit_pct', engine.DAILY_LOSS_LIMIT_PCT))
+    engine.MAX_CONSECUTIVE_LOSSES = int(get_setting('max_consecutive_losses', engine.MAX_CONSECUTIVE_LOSSES))
 
 _apply_trading_settings()
 
@@ -61,7 +64,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.3', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.5', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -147,7 +150,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.3', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.5', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -201,8 +204,10 @@ def news():
 
 
 class BotCapitalRequest(BaseModel):
-    deposit: float = Field(gt=0)
+    deposit: float = Field(gt=0, le=1000000)
     profit_lock_step: float | None = Field(default=None, gt=0)
+    working_capital: float | None = Field(default=None, gt=0, le=1000000)
+    available_capital_cap: float | None = Field(default=None, gt=0, le=1000000)
 
 @app.get('/api/bot-capital')
 def bot_capital():
@@ -214,7 +219,7 @@ def bot_capital():
 @app.post('/api/bot-capital')
 def update_bot_capital(req: BotCapitalRequest):
     try:
-        return set_bot_capital(req.deposit, req.profit_lock_step)
+        return set_bot_capital(req.deposit, req.profit_lock_step, req.working_capital, req.available_capital_cap)
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -222,18 +227,40 @@ class TradingConfigRequest(BaseModel):
     max_positions: int = Field(..., ge=1, le=20)
     risk_pct: float = Field(..., gt=0, le=50)
     leverage: float = Field(..., ge=1, le=100)
-    total_open_risk_pct: float = Field(..., gt=0, le=50)
+    total_open_risk_pct: float = Field(..., gt=0, le=100)
     auto_interval_sec: int = Field(..., ge=30, le=600)
+    daily_loss_limit: float | None = Field(default=None, gt=0, le=1000000)
+    bot_base_capital: float | None = Field(default=None, gt=0, le=1000000)
+    working_capital: float | None = Field(default=None, gt=0, le=1000000)
+    available_capital_cap: float | None = Field(default=None, gt=0, le=1000000)
+    profit_lock_step: float | None = Field(default=None, gt=0, le=1000000)
+    max_margin_fraction: float | None = Field(default=None, ge=0.01, le=1)
+    daily_loss_limit_pct: float | None = Field(default=None, gt=0, le=100)
+    max_consecutive_losses: int | None = Field(default=None, ge=0, le=100)
 
 @app.get('/api/trading-config')
 def trading_config():
     import engine
-    return {'ok': True, 'max_positions': engine.MAX_POSITIONS, 'default_leverage': engine.LEVERAGE, 'leverage_mode': engine.LEVERAGE_MODE, 'risk_pct': engine.RISK_PCT_DEFAULT, 'total_open_risk_pct': engine.TOTAL_OPEN_RISK_PCT, 'auto_interval_sec': AUTO_INTERVAL_SEC, 'full_market': engine.FULL_MARKET_DEFAULT}
+    cap = bot_capital_config()
+    return {
+        'ok': True, 'max_positions': engine.MAX_POSITIONS, 'default_leverage': engine.LEVERAGE,
+        'leverage_mode': engine.LEVERAGE_MODE, 'risk_pct': engine.RISK_PCT_DEFAULT,
+        'total_open_risk_pct': engine.TOTAL_OPEN_RISK_PCT, 'auto_interval_sec': AUTO_INTERVAL_SEC,
+        'full_market': engine.FULL_MARKET_DEFAULT,
+        'daily_loss_limit': float(get_setting('demo_max_daily_loss', engine.DEMO_MAX_DAILY_LOSS)),
+        'bot_base_capital': cap['deposit'], 'working_capital': cap['working_capital'],
+        'available_capital_cap': cap['available_capital_cap'], 'profit_lock_step': cap['profit_lock_step'],
+        'max_margin_fraction': engine.MAX_MARGIN_FRACTION,
+        'daily_loss_limit_pct': engine.DAILY_LOSS_LIMIT_PCT,
+        'max_consecutive_losses': engine.MAX_CONSECUTIVE_LOSSES,
+    }
 
 @app.post('/api/trading-config')
 def update_trading_config(req: TradingConfigRequest):
     global AUTO_INTERVAL_SEC
     import engine
+    if req.working_capital is not None and req.bot_base_capital is not None and req.working_capital > req.bot_base_capital:
+        raise HTTPException(status_code=400, detail='Рабочий капитал не может быть выше базового капитала')
     with auto_lock:
         engine.MAX_POSITIONS = int(req.max_positions)
         engine.RISK_PCT_DEFAULT = float(req.risk_pct)
@@ -242,13 +269,36 @@ def update_trading_config(req: TradingConfigRequest):
         engine.LEVERAGE = float(req.leverage)
         engine.LEVERAGE_MODE = 'auto'
         engine.TOTAL_OPEN_RISK_PCT = float(req.total_open_risk_pct)
+        if req.max_margin_fraction is not None:
+            engine.MAX_MARGIN_FRACTION = float(req.max_margin_fraction)
+        if req.daily_loss_limit_pct is not None:
+            engine.DAILY_LOSS_LIMIT_PCT = float(req.daily_loss_limit_pct)
+        if req.max_consecutive_losses is not None:
+            engine.MAX_CONSECUTIVE_LOSSES = int(req.max_consecutive_losses)
         AUTO_INTERVAL_SEC = int(req.auto_interval_sec)
         set_setting('max_positions', engine.MAX_POSITIONS)
         set_setting('risk_pct', engine.RISK_PCT_DEFAULT)
         set_setting('leverage', engine.LEVERAGE)
         set_setting('total_open_risk_pct', engine.TOTAL_OPEN_RISK_PCT)
         set_setting('auto_interval_sec', AUTO_INTERVAL_SEC)
-        auto_state['last_action'] = 'trading settings saved'
+        if req.daily_loss_limit is not None:
+            set_setting('demo_max_daily_loss', float(req.daily_loss_limit))
+        if req.max_margin_fraction is not None:
+            set_setting('max_margin_fraction', float(req.max_margin_fraction))
+        if req.daily_loss_limit_pct is not None:
+            set_setting('daily_loss_limit_pct', float(req.daily_loss_limit_pct))
+        if req.max_consecutive_losses is not None:
+            set_setting('max_consecutive_losses', int(req.max_consecutive_losses))
+        if any(v is not None for v in (req.bot_base_capital, req.profit_lock_step, req.working_capital, req.available_capital_cap)):
+            cap = bot_capital_config()
+            deposit = req.bot_base_capital if req.bot_base_capital is not None else cap['deposit']
+            working = req.working_capital if req.working_capital is not None else cap['working_capital']
+            available = req.available_capital_cap if req.available_capital_cap is not None else cap['available_capital_cap']
+            step = req.profit_lock_step if req.profit_lock_step is not None else cap['profit_lock_step']
+            if working > deposit:
+                raise HTTPException(status_code=400, detail='Рабочий капитал не может быть выше базового капитала')
+            set_bot_capital(deposit, step, working, available)
+        auto_state['last_action'] = 'all manual trading/risk settings saved'
     return trading_config()
 
 @app.get('/api/markets')
