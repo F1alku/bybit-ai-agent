@@ -21,3 +21,19 @@ def test_order_id_alias_links_closed_pnl_to_entry_context(tmp_path, monkeypatch)
     journal.upsert_closed_pnl('demo', {'orderId':'OID-1','orderLinkId':'LINK-1','symbol':'BTCUSDT','side':'Buy','qty':'1','avgEntryPrice':'100','avgExitPrice':'102','closedPnl':'2','openFee':'0.01','closeFee':'0.01','createdTime':'1','updatedTime':'2'})
     report=learning_engine.build_learning_report()
     assert report['trades_analyzed']==1
+
+def test_closed_trade_creates_persistent_lesson(tmp_path, monkeypatch):
+    import journal, learning_engine
+    db=tmp_path/'lesson.db'
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(db))
+    monkeypatch.setattr(learning_engine, '_conn', journal._conn)
+    monkeypatch.setattr(learning_engine, '_lock', journal._lock)
+    monkeypatch.setattr(learning_engine, 'recent', journal.recent)
+    monkeypatch.setattr(learning_engine, 'aliases_for_orders', journal.aliases_for_orders)
+    learning_engine.record_trade_meta({'external_id':'LESSON-1','mode':'demo','symbol':'BTCUSDT','side':'Buy','strategy':'normal','score':84,'risk_pct':2,'leverage':10,'planned_risk':0.5,'entry_price':100,'stop_loss':99,'take_profit':102})
+    journal.upsert_closed_pnl('demo', {'orderId':'OID-L1','orderLinkId':'LESSON-1','symbol':'BTCUSDT','side':'Buy','qty':'1','avgEntryPrice':'100','avgExitPrice':'102','closedPnl':'2','openFee':'0.01','closeFee':'0.01','createdTime':'1','updatedTime':'2'})
+    result=learning_engine.record_lessons_from_closed()
+    lessons=learning_engine.recent_lessons()
+    assert result['created_or_updated']==1
+    assert lessons[0]['outcome']=='WIN'
+    assert abs(lessons[0]['r_multiple']-3.96)<1e-9

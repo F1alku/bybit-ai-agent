@@ -441,3 +441,19 @@ def test_trading_config_api_persists_and_applies(monkeypatch, tmp_path):
     assert engine.MAX_POSITIONS == 6 and engine.RISK_PCT_DEFAULT == 1.5 and engine.LEVERAGE == 25 and engine.TOTAL_OPEN_RISK_PCT == 7.5 and engine.DEMO_MAX_DAILY_LOSS == 35 and engine.DAILY_LOSS_LIMIT_PCT == 12
     assert journal.get_setting('max_positions') == '6' and journal.get_setting('risk_pct') == '1.5'
     engine.MAX_POSITIONS, engine.RISK_PCT_DEFAULT, engine.LEVERAGE, engine.TOTAL_OPEN_RISK_PCT = original
+
+
+def test_paper_auto_uses_persisted_max_positions(monkeypatch):
+    import trader
+    import engine
+    monkeypatch.setattr(trader, 'scan_market', lambda *a, **k: {'results': [], 'entry_threshold': k.get('entry_threshold', 70)})
+    monkeypatch.setattr(trader, 'paper_state', lambda: {'open': [], 'risk_locked': False})
+    monkeypatch.setattr(trader, '_trading_settings', lambda: (2.0, 10.0, 25))
+    monkeypatch.setattr(trader, 'MODE', 'paper')
+    old = engine.MAX_POSITIONS
+    engine.MAX_POSITIONS = 8
+    try:
+        result, action, diag = trader.run_auto_cycle()
+        assert diag['max_positions'] == 25
+    finally:
+        engine.MAX_POSITIONS = old
