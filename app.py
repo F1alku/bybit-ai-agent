@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position, trade_monitor_snapshot, bot_capital_config, set_bot_capital
 from journal import init_db, recent as journal_recent, sync_closed_pnl, get_setting, set_setting
-from learning_engine import build_learning_report, init_learning_db
+from learning_engine import build_learning_report, init_learning_db, record_lessons_from_closed, recent_lessons
 from news_engine import snapshot as news_snapshot
 from trader import run_auto_cycle
 
@@ -46,6 +46,12 @@ async def lifespan(_app):
     init_db()
     init_learning_db()
     _apply_trading_settings()
+    if MODE in ('demo','live'):
+        try:
+            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
+            record_lessons_from_closed(1000)
+        except Exception:
+            pass
     # v6.1: first deployment can opt Demo AUTO into the persistent setting once.
     # After the migration the user's manual ON/OFF choice remains authoritative.
     if os.getenv('AUTO_ENABLED','false').lower() == 'true' and get_setting('auto_migrated_v61') != '1':
@@ -64,7 +70,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.4', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.8', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -150,7 +156,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.4', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.8', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -224,7 +230,7 @@ def update_bot_capital(req: BotCapitalRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 class TradingConfigRequest(BaseModel):
-    max_positions: int = Field(..., ge=1, le=20)
+    max_positions: int = Field(..., ge=1, le=100)
     risk_pct: float = Field(..., gt=0, le=50)
     leverage: float = Field(..., ge=1, le=100)
     total_open_risk_pct: float = Field(..., gt=0, le=50)
@@ -369,9 +375,24 @@ def learning():
     try:
         if MODE in ('demo','live'):
             sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
-        return {'ok': True, **build_learning_report(1000)}
+        report=build_learning_report(1000)
+        report['durable_journal']=bool(os.getenv('DATABASE_URL','').strip())
+        if not report['durable_journal']:
+            report['persistence_warning']='DATABASE_URL не настроен: локальный SQLite на Render не переживает перезапуск сервиса.'
+        return {'ok': True, **report}
     except Exception as e:
         return {'ok': False, 'error': str(e), 'learning_enabled': True}
+
+@app.get('/api/learning/lessons')
+def learning_lessons():
+    try:
+        if MODE in ('demo','live'):
+            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
+            record_lessons_from_closed(1000)
+        return {'ok': True, 'durable_journal': bool(os.getenv('DATABASE_URL','').strip()), 'lessons': recent_lessons(100)}
+    except Exception as e:
+        return {'ok': False, 'lessons': [], 'error': str(e)}
+
 
 @app.get('/api/journal')
 def journal():

@@ -201,3 +201,13 @@ The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-mar
 - `0` for the available-to-bot limit means no additional cap; actual availability still accounts for reserved margin and unrealized losses.
 - These settings persist through the existing settings database and are applied on startup.
 - Existing NORMAL/SCALP scanner and AUTO logic was not intentionally changed by this release.
+
+
+## Overnight learning and restart safety — v6.1.8
+
+- Every successful Demo entry stores entry context (strategy, score, risk, leverage, regime, timing, news, SL/TP).
+- Closed Bybit PnL is synchronized into the journal and converted into a persistent post-trade lesson: outcome, net PnL, R-multiple, what went right and what went wrong.
+- Learning is observational only; it does not silently rewrite strategy parameters or place orders.
+- Demo positions and server-side SL/TP live on Bybit and therefore survive a Render web-service restart.
+- The journal and learning memory survive Render restarts only when `DATABASE_URL` points to durable Postgres. Local `/tmp/bybit_agent.db` is a test fallback and is ephemeral on Render.
+- Startup synchronizes recent closed PnL and rebuilds the learning lesson cache before AUTO begins.

@@ -37,6 +37,13 @@ def init_learning_db():
             value TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS learning_lessons (
+            external_id TEXT PRIMARY KEY,
+            mode TEXT, symbol TEXT, side TEXT, strategy TEXT, outcome TEXT,
+            net_pnl REAL, r_multiple REAL, score REAL, planned_risk REAL,
+            lesson TEXT NOT NULL, what_went_right TEXT, what_went_wrong TEXT,
+            created_at REAL NOT NULL
+        )''')
         for col, typ in [('stop_loss','REAL'),('take_profit','REAL'),('entry_price','REAL')]:
             try:
                 cur.execute(f'ALTER TABLE learning_trade_meta ADD COLUMN {col} {typ}')
@@ -117,9 +124,65 @@ def _group(rows, key):
     return {str(k):_stats(v) for k,v in groups.items()}
 
 
+def record_lessons_from_closed(limit=1000):
+    """Persist an explainable post-trade lesson for each closed trade."""
+    init_learning_db()
+    rows = _closed_rows(limit)
+    with _lock, _conn() as c:
+        cur = c.cursor()
+        cur.execute('SELECT external_id,mode,symbol,side,strategy,score,risk_pct,planned_risk,market_regime,entry_timing,news_impact FROM learning_trade_meta')
+        cols = ['external_id','mode','symbol','side','strategy','score','risk_pct','planned_risk','market_regime','entry_timing','news_impact']
+        meta = {str(r[0]): dict(zip(cols, r)) for r in cur.fetchall()}
+    aliases = aliases_for_orders([r.get('external_id') for r in rows])
+    lessons=[]
+    for r in rows:
+        key=str(r['external_id']); m=meta.get(key)
+        if not m and aliases.get(key): m=meta.get(str(aliases[key]))
+        if not m: continue
+        net=float(r.get('net_pnl') or 0); planned=float(m.get('planned_risk') or 0)
+        outcome='WIN' if net>0 else 'LOSS' if net<0 else 'BREAKEVEN'
+        r_mult=(net/planned) if planned>0 else None; score=float(m.get('score') or 0)
+        right=[]; wrong=[]
+        if net>0: right.append('Сделка закрылась в плюс после учёта комиссии.')
+        elif net<0: wrong.append('Сделка закрылась в минус после учёта комиссии.')
+        if score>=80 and net<=0: wrong.append(f'Высокий входной score {score:g} не подтвердился результатом.')
+        if score<70 and net>0: right.append(f'Движение подтвердилось несмотря на score {score:g}.')
+        lesson=f"{outcome}: {m.get('symbol','?')} {m.get('side','?')}, {m.get('strategy','?')}, net P&L {net:+.4f} USDT"
+        if r_mult is not None: lesson+=f", результат {r_mult:+.2f}R"
+        lesson+=f". Контекст: regime={m.get('market_regime') or 'UNKNOWN'}, timing={m.get('entry_timing') or 'UNKNOWN'}, news={m.get('news_impact') or 'UNKNOWN'}."
+        row=(key,str(m.get('mode') or r.get('mode') or ''),str(m.get('symbol') or r.get('symbol') or ''),str(m.get('side') or r.get('side') or ''),str(m.get('strategy') or ''),outcome,net,r_mult,score,planned,lesson,' '.join(right),' '.join(wrong),time.time())
+        with _lock, _conn() as c:
+            cur=c.cursor()
+            if str(c.__class__.__module__).startswith('psycopg'):
+                cur.execute("""INSERT INTO learning_lessons
+                    (external_id,mode,symbol,side,strategy,outcome,net_pnl,r_multiple,score,planned_risk,lesson,what_went_right,what_went_wrong,created_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (external_id) DO UPDATE SET outcome=EXCLUDED.outcome,net_pnl=EXCLUDED.net_pnl,r_multiple=EXCLUDED.r_multiple,lesson=EXCLUDED.lesson,what_went_right=EXCLUDED.what_went_right,what_went_wrong=EXCLUDED.what_went_wrong""", row)
+            else:
+                cur.execute("""INSERT INTO learning_lessons
+                    (external_id,mode,symbol,side,strategy,outcome,net_pnl,r_multiple,score,planned_risk,lesson,what_went_right,what_went_wrong,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(external_id) DO UPDATE SET outcome=excluded.outcome,net_pnl=excluded.net_pnl,r_multiple=excluded.r_multiple,lesson=excluded.lesson,what_went_right=excluded.what_went_right,what_went_wrong=excluded.what_went_wrong""", row)
+        lessons.append({'external_id':key,'outcome':outcome,'net_pnl':net,'r_multiple':r_mult,'lesson':lesson,'what_went_right':' '.join(right),'what_went_wrong':' '.join(wrong)})
+    return {'created_or_updated':len(lessons),'lessons':lessons}
+
+
+def recent_lessons(limit=50):
+    init_learning_db()
+    with _lock, _conn() as c:
+        cur=c.cursor()
+        cols=['external_id','mode','symbol','side','strategy','outcome','net_pnl','r_multiple','score','planned_risk','lesson','what_went_right','what_went_wrong','created_at']
+        if str(c.__class__.__module__).startswith('psycopg'):
+            cur.execute('SELECT external_id,mode,symbol,side,strategy,outcome,net_pnl,r_multiple,score,planned_risk,lesson,what_went_right,what_went_wrong,created_at FROM learning_lessons ORDER BY created_at DESC LIMIT %s',(int(limit),))
+        else:
+            cur.execute('SELECT external_id,mode,symbol,side,strategy,outcome,net_pnl,r_multiple,score,planned_risk,lesson,what_went_right,what_went_wrong,created_at FROM learning_lessons ORDER BY created_at DESC LIMIT ?',(int(limit),))
+        return [dict(zip(cols,r)) for r in cur.fetchall()]
+
+
 def build_learning_report(limit=1000):
     init_learning_db()
     rows=_closed_rows(limit)
+    lesson_sync=record_lessons_from_closed(limit)
     report={
         'learning_enabled': True,
         'auto_apply': False,
@@ -130,6 +193,8 @@ def build_learning_report(limit=1000):
         'by_side': _group(rows,'side'),
         'minimum_samples_for_insight': 20,
         'insights': [],
+        'recent_lessons': recent_lessons(50),
+        'lesson_sync': {'created_or_updated': lesson_sync.get('created_or_updated', 0)},
         'generated_at': int(time.time()*1000),
     }
     # Contextual grouping is only possible when entry metadata exists.

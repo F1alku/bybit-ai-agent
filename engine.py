@@ -1180,9 +1180,85 @@ def demo_open(d):
     return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'bot_capital':cap,'leverage':leverage,'actual_risk_usdt':actual_risk,'min_notional':constraints['min_notional'],'max_leverage':constraints['max_leverage'],'order':result}
 
 
+def _partial_take_profit_key(p):
+    return f"partial_tp_10:{p.get('symbol')}:{p.get('side')}:{p.get('avgPrice')}"
+
+def manage_open_positions():
+    """Manage open Demo positions after entry.
+
+    At +10% unrealised P&L on position margin, lock in a 10% quantity partial
+    close once per position. The remaining position is then re-evaluated from
+    5m momentum. If the move is still aligned, protect the remainder by moving
+    SL to breakeven (never loosen an existing SL). If momentum is against the
+    position, leave the hard stop in force and mark EXIT REVIEW for the next
+    cycle.
+    """
+    if MODE not in ('demo','live'):
+        return {'ok': True, 'mode': MODE, 'actions': []}
+    actions=[]
+    try:
+        positions=exchange_positions()
+    except Exception as e:
+        return {'ok':False,'mode':MODE,'actions':[],'error':str(e)}
+    for p in positions:
+        try:
+            size=abs(float(p.get('size') or 0)); entry=float(p.get('avgPrice') or 0); mark=float(p.get('markPrice') or entry)
+            margin=abs(float(p.get('positionIM') or 0)); upnl=float(p.get('unrealisedPnl') or 0)
+            if size<=0 or entry<=0 or margin<=0:
+                continue
+            pnl_pct=(upnl/margin)*100
+            if pnl_pct < 10.0:
+                continue
+            key=_partial_take_profit_key(p)
+            if get_setting(key, '0') == '1':
+                continue
+            symbol=str(p.get('symbol')); side=str(p.get('side'))
+            qty_step,min_qty,_max_qty=_symbol_rules(symbol)
+            partial=size*0.10
+            if qty_step>0:
+                partial=_round_step(partial,qty_step)
+            if min_qty>0 and partial<min_qty:
+                partial=min_qty
+            if partial<=0 or partial>size:
+                continue
+            close_side='Sell' if side=='Buy' else 'Buy'
+            order=bybit_private_post('/v5/order/create',{
+                'category':'linear','symbol':symbol,'side':close_side,'orderType':'Market','qty':str(partial),
+                'positionIdx':int(p.get('positionIdx') or 0),'reduceOnly':True,'closeOnTrigger':True,
+                'orderLinkId':f'ai-partial10-{int(time.time()*1000)}'
+            })
+            set_setting(key,'1')
+            actions.append({'symbol':symbol,'action':'PARTIAL_TP_10','closed_qty':partial,'position_qty':size,'pnl_on_margin_pct':round(pnl_pct,3),'order':order})
+            # Reassess the remainder after the partial close.
+            try:
+                k=klines(symbol,'5',60); ff=frame_features(k)
+                ret_3=(float(k.close.iloc[-1])/float(k.close.iloc[-4])-1)*100 if len(k)>=4 else 0.0
+                bias='LONG' if ret_3>0.15 else 'SHORT' if ret_3<-0.15 else 'NEUTRAL'
+            except Exception:
+                bias='UNKNOWN'
+            aligned=(bias==('LONG' if side=='Buy' else 'SHORT'))
+            current_sl=float(p.get('stopLoss') or 0)
+            if aligned:
+                # Move SL to entry only when that improves protection.
+                improve=(side=='Buy' and (current_sl<=0 or current_sl<entry)) or (side=='Sell' and (current_sl<=0 or current_sl>entry))
+                if improve:
+                    bybit_private_post('/v5/position/trading-stop',{
+                        'category':'linear','symbol':symbol,'positionIdx':int(p.get('positionIdx') or 0),
+                        'stopLoss':str(entry),'slTriggerBy':'MarkPrice'
+                    })
+                    actions[-1]['remainder']='HOLD/TRAIL; SL moved to breakeven'
+                else:
+                    actions[-1]['remainder']='HOLD/TRAIL'
+            else:
+                actions[-1]['remainder']='EXIT REVIEW; hard SL remains active'
+            _invalidate_demo_account_cache()
+        except Exception as e:
+            actions.append({'symbol':p.get('symbol'),'action':'MANAGEMENT_ERROR','error':str(e)})
+    return {'ok':True,'mode':MODE,'actions':actions,'checked_at':int(time.time()*1000)}
+
 def trade_monitor_snapshot():
     """Reassess currently open exchange positions without changing them.
-    This is an event-aware decision aid: it never overrides the hard risk limits.
+    The actual automatic position manager is called by AUTO, not by this read-only endpoint.
     """
     if MODE not in ('demo','live'):
         return {'ok': True, 'mode': 'paper', 'positions': []}
@@ -1207,7 +1283,8 @@ def trade_monitor_snapshot():
         elif pnl_pct < 0 and aligned: decision='HOLD / REASSESS'
         elif pnl_pct < -5 and not aligned: decision='EXIT REVIEW'
         else: decision='REASSESS'
-        out.append({'symbol':symbol,'side':side,'avg_price':avg,'mark_price':mark,'unrealised_pnl':upnl,'pnl_on_margin_pct':round(pnl_pct,3),'momentum_5m_pct':round(ret_3,4),'momentum_bias_5m':bias_5,'atr_pct':round(atr_pct,3),'idea_aligned':aligned,'decision':decision,'news_status':news.get('status'),'news_impact':news.get('impact'),'hard_stop_note':'Hard capital/risk limits always override HOLD.'})
+        notional=abs(float(p.get('positionValue') or 0)) or abs(float(p.get('size') or 0))*mark
+        out.append({'symbol':symbol,'side':side,'avg_price':avg,'mark_price':mark,'size':float(p.get('size') or 0),'notional':round(notional,6),'margin':round(margin,6),'leverage':float(p.get('leverage') or 0),'stop_loss':float(p.get('stopLoss') or 0),'take_profit':float(p.get('takeProfit') or 0),'unrealised_pnl':upnl,'pnl_on_margin_pct':round(pnl_pct,3),'momentum_5m_pct':round(ret_3,4),'momentum_bias_5m':bias_5,'atr_pct':round(atr_pct,3),'idea_aligned':aligned,'decision':decision,'partial_take_profit_threshold_pct':10.0,'partial_take_profit_fraction':0.10,'news_status':news.get('status'),'news_impact':news.get('impact'),'hard_stop_note':'Hard capital/risk limits always override HOLD.'})
     return {'ok':True,'mode':MODE,'positions':out,'checked_at':int(time.time()*1000)}
 
 def exchange_positions():

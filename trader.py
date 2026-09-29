@@ -1,5 +1,5 @@
 import os, time
-from engine import MODE, MAX_POSITIONS, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market
+from engine import MODE, MAX_POSITIONS, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market, manage_open_positions
 
 STRATEGY_DEFAULT = os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both'
 
@@ -44,6 +44,7 @@ def run_auto_cycle():
     """
     strategy, setup_interval, score_gate = _strategy_config()
     risk_pct, leverage, max_positions = _trading_settings()
+    position_management = manage_open_positions() if MODE in ('demo','live') else {'ok': True, 'actions': []}
     modes = ['normal','scalp'] if strategy == 'both' else [strategy]
     def scan_mode(mode):
         interval = '15' if mode == 'normal' else '5'
@@ -89,17 +90,20 @@ def run_auto_cycle():
             try:
                 demo_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':risk_pct,'leverage':leverage,'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
                 opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100"); used += 1
-            except (ValueError, RuntimeError) as e: rejected.append(f"{x['symbol']}: {e}")
+            except (ValueError, RuntimeError) as e: rejected.append(f"{x.get('strategy','?').upper()} {x['symbol']}: {e}")
+            except Exception as e: rejected.append(f"{x.get('strategy','?').upper()} {x['symbol']}: unexpected execution error: {e}")
         result = scans[modes[0]] if len(modes)==1 else {'ok':True,'mode':MODE,'strategy':'both','scans':scans,'results':sum([r.get('results',[]) for r in scans.values()],[])}
         prefix='AUTO LIVE' if MODE=='live' else 'AUTO DEMO'
         action=f"{prefix}: {', '.join(opened)}" if opened else 'scan complete — no exchange entry'
         if rejected: action += f" • rejected: {rejected[0]}"
         diagnostics={
             'stage':'execution',
+            'position_management': position_management,
             'candidate_stats':candidate_stats,
             'candidates':len(candidates),
             'opened':len(opened),
             'rejected':rejected[:20],
+            'rejection_count':len(rejected),
             'open_positions_before':len(positions),
             'max_positions':max_positions,
             'risk_pct':risk_pct,
@@ -128,7 +132,7 @@ def run_auto_cycle():
         if x['symbol'] not in best or float(x.get('score',0))>float(best[x['symbol']].get('score',0)): best[x['symbol']]=x
     opened=[]; rejected=[]; used=len(state.get('open',[]))
     for x in sorted(best.values(),key=lambda x:float(x.get('score',0)),reverse=True):
-        if used>=MAX_POSITIONS: break
+        if used>=max_positions: break
         try:
             paper_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':risk_pct,'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
             opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100"); used+=1
@@ -142,6 +146,7 @@ def run_auto_cycle():
         'candidates':len(best),
         'opened':len(opened),
         'rejected':rejected[:20],
+        'rejection_count':len(rejected),
         'open_positions_before':len(state.get('open',[])),
         'max_positions':max_positions,
         'risk_pct':risk_pct,
