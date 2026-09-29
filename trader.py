@@ -1,5 +1,5 @@
 import os, time
-from engine import MODE, MAX_POSITIONS, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market
+from engine import MODE, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market
 
 STRATEGY_DEFAULT = os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both'
 
@@ -27,11 +27,23 @@ def _strategy_config():
 
 SCAN_CANDIDATES = 0
 
+def _trading_settings():
+    import engine
+    try:
+        from journal import get_setting
+        risk_pct = float(get_setting('risk_pct', engine.RISK_PCT_DEFAULT))
+        leverage = float(get_setting('leverage', engine.LEVERAGE))
+        max_positions = int(get_setting('max_positions', engine.MAX_POSITIONS))
+    except Exception:
+        risk_pct, leverage, max_positions = engine.RISK_PCT_DEFAULT, engine.LEVERAGE, engine.MAX_POSITIONS
+    return risk_pct, leverage, max_positions
+
 def run_auto_cycle():
     """Single trading cycle. NORMAL and SCALP may scan concurrently in the same cycle.
     A symbol can only have one one-way position, so duplicate symbols are resolved by score.
     """
     strategy, setup_interval, score_gate = _strategy_config()
+    risk_pct, leverage, max_positions = _trading_settings()
     modes = ['normal','scalp'] if strategy == 'both' else [strategy]
     def scan_mode(mode):
         interval = '15' if mode == 'normal' else '5'
@@ -49,7 +61,7 @@ def run_auto_cycle():
         if state.get('error'): return None, 'Exchange sync error', None
         if state.get('risk_locked'): return None, 'risk lock active — no new exchange entry', None
         positions = state.get('positions', [])
-        if len(positions) >= MAX_POSITIONS: return None, f'max {MAX_POSITIONS} exchange positions — monitoring', None
+        if len(positions) >= max_positions: return None, f'max {max_positions} exchange positions — monitoring', None
         scans = {m: scan_mode(m) for m in modes}
         candidates=[]
         for m,r in scans.items():
@@ -65,9 +77,9 @@ def run_auto_cycle():
         candidates=sorted(best.values(), key=lambda x: float(x.get('score',0)), reverse=True)
         opened=[]; rejected=[]; used=len(positions)
         for x in candidates:
-            if used >= MAX_POSITIONS: break
+            if used >= max_positions: break
             try:
-                demo_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':2.0,'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
+                demo_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':risk_pct,'leverage':leverage,'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
                 opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100"); used += 1
             except (ValueError, RuntimeError) as e: rejected.append(f"{x['symbol']}: {e}")
         result = scans[modes[0]] if len(modes)==1 else {'ok':True,'mode':MODE,'strategy':'both','scans':scans,'results':sum([r.get('results',[]) for r in scans.values()],[])}
@@ -79,7 +91,7 @@ def run_auto_cycle():
     paper_mark_to_market()
     state=paper_state()
     if state.get('risk_locked'): return None,'risk lock active — no paper entry',None
-    if len(state.get('open',[])) >= MAX_POSITIONS: return None,f'max {MAX_POSITIONS} paper positions — monitoring',None
+    if len(state.get('open',[])) >= max_positions: return None,f'max {max_positions} paper positions — monitoring',None
     scans={m:scan_mode(m) for m in modes}
     candidates=[]
     for m,r in scans.items():
@@ -94,7 +106,7 @@ def run_auto_cycle():
     for x in sorted(best.values(),key=lambda x:float(x.get('score',0)),reverse=True):
         if used>=MAX_POSITIONS: break
         try:
-            paper_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':2.0,'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
+            paper_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':risk_pct,'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
             opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100"); used+=1
         except ValueError as e: rejected.append(f"{x['symbol']}: {e}")
     result=scans[modes[0]] if len(modes)==1 else {'ok':True,'mode':MODE,'strategy':'both','scans':scans,'results':sum([r.get('results',[]) for r in scans.values()],[])}

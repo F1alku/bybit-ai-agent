@@ -24,7 +24,7 @@ services:
       - key: DEFAULT_LEVERAGE
         value: '10'
       - key: LEVERAGE_MODE
-        value: fixed
+        value: auto
       - key: TOTAL_OPEN_RISK_PCT
         value: '8'
       - key: FULL_MARKET_DEFAULT
@@ -85,7 +85,7 @@ services:
       - key: DEFAULT_LEVERAGE
         value: '10'
       - key: LEVERAGE_MODE
-        value: fixed
+        value: auto
       - key: TOTAL_OPEN_RISK_PCT
         value: '8'
       - key: STRATEGY_MODE

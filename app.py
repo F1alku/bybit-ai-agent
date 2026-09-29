@@ -16,7 +16,7 @@ from learning_engine import build_learning_report, init_learning_db
 from news_engine import snapshot as news_snapshot
 from trader import run_auto_cycle
 
-AUTO_INTERVAL_SEC = int(os.getenv('AUTO_INTERVAL_SEC', '60'))
+AUTO_INTERVAL_SEC = int(get_setting('auto_interval_sec', os.getenv('AUTO_INTERVAL_SEC', '60')))
 SCAN_CANDIDATES = 0  # 0 = full active Bybit USDT perpetual market
 auto_lock = threading.RLock()
 scan_lock = threading.Lock()
@@ -26,10 +26,23 @@ scan_executor = ThreadPoolExecutor(max_workers=1)
 strategy_state = {'mode': os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
 auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('AUTO_ENABLED','false').lower() == 'true' else '0'))), 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0, 'last_duration_sec': None, 'pending': False}
 
+def _apply_trading_settings():
+    import engine
+    engine.MAX_POSITIONS = int(get_setting('max_positions', engine.MAX_POSITIONS))
+    engine.RISK_PCT_DEFAULT = float(get_setting('risk_pct', engine.RISK_PCT_DEFAULT))
+    engine.DEMO_RISK_PCT = engine.RISK_PCT_DEFAULT
+    engine.LIVE_RISK_PCT = engine.RISK_PCT_DEFAULT
+    engine.LEVERAGE = float(get_setting('leverage', engine.LEVERAGE))
+    engine.LEVERAGE_MODE = 'auto'
+    engine.TOTAL_OPEN_RISK_PCT = float(get_setting('total_open_risk_pct', engine.TOTAL_OPEN_RISK_PCT))
+
+_apply_trading_settings()
+
 @asynccontextmanager
 async def lifespan(_app):
     init_db()
     init_learning_db()
+    _apply_trading_settings()
     # v6.1: first deployment can opt Demo AUTO into the persistent setting once.
     # After the migration the user's manual ON/OFF choice remains authoritative.
     if os.getenv('AUTO_ENABLED','false').lower() == 'true' and get_setting('auto_migrated_v61') != '1':
@@ -48,7 +61,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.0', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.2', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -132,7 +145,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.0.4', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.2', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -203,10 +216,38 @@ def update_bot_capital(req: BotCapitalRequest):
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+class TradingConfigRequest(BaseModel):
+    max_positions: int = Field(..., ge=1, le=20)
+    risk_pct: float = Field(..., gt=0, le=5)
+    leverage: float = Field(..., ge=1, le=100)
+    total_open_risk_pct: float = Field(..., gt=0, le=50)
+    auto_interval_sec: int = Field(..., ge=30, le=600)
+
 @app.get('/api/trading-config')
 def trading_config():
     import engine
-    return {'ok': True, 'max_positions': engine.MAX_POSITIONS, 'default_leverage': engine.LEVERAGE, 'leverage_mode': engine.LEVERAGE_MODE, 'risk_pct': engine.RISK_PCT_DEFAULT, 'total_open_risk_pct': engine.TOTAL_OPEN_RISK_PCT, 'full_market': engine.FULL_MARKET_DEFAULT}
+    return {'ok': True, 'max_positions': engine.MAX_POSITIONS, 'default_leverage': engine.LEVERAGE, 'leverage_mode': engine.LEVERAGE_MODE, 'risk_pct': engine.RISK_PCT_DEFAULT, 'total_open_risk_pct': engine.TOTAL_OPEN_RISK_PCT, 'auto_interval_sec': AUTO_INTERVAL_SEC, 'full_market': engine.FULL_MARKET_DEFAULT}
+
+@app.post('/api/trading-config')
+def update_trading_config(req: TradingConfigRequest):
+    global AUTO_INTERVAL_SEC
+    import engine
+    with auto_lock:
+        engine.MAX_POSITIONS = int(req.max_positions)
+        engine.RISK_PCT_DEFAULT = float(req.risk_pct)
+        engine.DEMO_RISK_PCT = float(req.risk_pct)
+        engine.LIVE_RISK_PCT = float(req.risk_pct)
+        engine.LEVERAGE = float(req.leverage)
+        engine.LEVERAGE_MODE = 'auto'
+        engine.TOTAL_OPEN_RISK_PCT = float(req.total_open_risk_pct)
+        AUTO_INTERVAL_SEC = int(req.auto_interval_sec)
+        set_setting('max_positions', engine.MAX_POSITIONS)
+        set_setting('risk_pct', engine.RISK_PCT_DEFAULT)
+        set_setting('leverage', engine.LEVERAGE)
+        set_setting('total_open_risk_pct', engine.TOTAL_OPEN_RISK_PCT)
+        set_setting('auto_interval_sec', AUTO_INTERVAL_SEC)
+        auto_state['last_action'] = 'trading settings saved'
+    return trading_config()
 
 @app.get('/api/markets')
 def markets():

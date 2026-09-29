@@ -1,4 +1,4 @@
-# Bybit AI Agent — v6.1.0 UI Redesign + $10K Demo Capital + AUTO
+# Bybit AI Agent — v6.1.2 UI Redesign + $10K Demo Capital + AUTO
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -163,3 +163,11 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 - Demo risk gate remains strict: minimum Bybit order requirements cannot silently increase the configured 2% risk.
 
 - If AUTO collides with a manual diagnostic scan, it is now queued and starts immediately after the manual scan releases the lock instead of simply disappearing for the next interval.
+
+
+## v6.1.2
+- Fixed Demo sync/open-position UI null-element bug.
+- Open positions now render with Trade Monitor decision, P&L, Entry/Mark, SL/TP, leverage and Market close.
+- Added persistent AUTO trading controls: max positions, risk %, leverage, total open risk %, and AUTO interval.
+- AUTO and manual Demo entries use the saved risk/leverage settings.
+- Leverage mode uses automatic per-symbol cap when the requested leverage exceeds Bybit limits.
