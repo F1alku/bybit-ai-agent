@@ -54,10 +54,10 @@ BOT_AVAILABLE_CAPITAL_MAX = float(os.getenv('BOT_AVAILABLE_CAPITAL_MAX', '100000
 # calls are reserved for a small ranked subset.
 TECH_CANDIDATES = int(os.getenv('TECH_CANDIDATES', '24'))
 DEEP_CANDIDATES = int(os.getenv('DEEP_CANDIDATES', '12'))
-MICRO_CANDIDATES = int(os.getenv('MICRO_CANDIDATES', '8'))
-FULL_MARKET_DEEP_CANDIDATES = int(os.getenv('FULL_MARKET_DEEP_CANDIDATES', '30'))
+MICRO_CANDIDATES = int(os.getenv('MICRO_CANDIDATES', '6'))
+FULL_MARKET_DEEP_CANDIDATES = int(os.getenv('FULL_MARKET_DEEP_CANDIDATES', '20'))
 FULL_MARKET_DEFAULT = os.getenv('FULL_MARKET_DEFAULT', 'true').lower() == 'true'
-FULL_MARKET_WORKERS = int(os.getenv('FULL_MARKET_WORKERS', '6'))
+FULL_MARKET_WORKERS = int(os.getenv('FULL_MARKET_WORKERS', '10'))
 INSTRUMENT_CACHE_TTL = 600.0
 DAILY_LOSS_LIMIT_PCT = float(os.getenv('DAILY_LOSS_LIMIT_PCT', '6'))
 MAX_CONSECUTIVE_LOSSES = 3
@@ -621,7 +621,8 @@ def _deep_one(item, interval, btc_context, entry_threshold=ENTRY_SCORE_MIN, stra
     # Deep analysis is bounded. Five timeframes are fetched once and then served
     # from the shared 60s cache to both NORMAL and SCALP when the same symbol is used.
     frames = {k: klines(symbol, k, 180) for k in ('5', '15', '60', '240', 'D')}
-    return score(frames, interval, micro=None, live_price=item['price'], btc_context=btc_context, entry_threshold=entry_threshold, strategy=strategy)
+    result = score(frames, interval, micro=None, live_price=item['price'], btc_context=btc_context, entry_threshold=entry_threshold, strategy=strategy)
+    return result, frames
 
 
 def _json_safe(value):
@@ -699,7 +700,7 @@ def scan_market(interval='15', limit_symbols=0, entry_threshold=ENTRY_SCORE_MIN,
         for fut in as_completed(futures):
             item=futures[fut]
             try:
-                a=fut.result(); a.update({'symbol':item['symbol'],'turnover24h':item['turnover24h'],'enriched':False}); scored.append(a)
+                a, frames = fut.result(); a.update({'symbol':item['symbol'],'turnover24h':item['turnover24h'],'enriched':False,'_frames':frames}); scored.append(a)
             except Exception as e:
                 failures.append({'symbol':item['symbol'],'stage':'deep','error':str(e)})
 
@@ -720,12 +721,13 @@ def scan_market(interval='15', limit_symbols=0, entry_threshold=ENTRY_SCORE_MIN,
         if s in micro_map:
             try:
                 item=next(i for i in deep if i['symbol']==s)
-                frames={k: klines(s, k, 180) for k in ('5','15','60','240','D')}
+                frames=x.get('_frames') or {k: klines(s, k, 180) for k in ('5','15','60','240','D')}
                 a=score(frames,interval,micro=micro_map[s],live_price=item['price'],btc_context=btc_context,entry_threshold=entry_threshold,strategy=strategy)
                 a.update({'symbol':s,'turnover24h':x['turnover24h'],'enriched':True}); results.append(a)
                 continue
             except Exception as e: failures.append({'symbol':s,'stage':'rescore','error':str(e)})
-        x.pop('frames',None); results.append(x)
+        x.pop('frames',None); x.pop('_frames',None); results.append(x)
+    for x in results: x.pop('_frames', None)
     results.sort(key=lambda x:x.get('score',x.get('hint',0)), reverse=True)
     # News is a contextual filter, not an independent signal. A headline only blocks
     # when relevance is high and BTC/market reaction confirms it.
