@@ -1,4 +1,4 @@
-# Bybit AI Agent — v6.1.2 UI Redesign + $10K Demo Capital + AUTO
+# Bybit AI Agent — v6.1.3 AUTO Execution Fix + Full-Market Demo
 
 Web-based Bybit market scanner/trader for Paper and Bybit Demo Trading.
 
@@ -36,8 +36,8 @@ The UI deliberately separates the Bybit account totals from the bot's budget:
 - USDT wallet balance
 - Bybit total equity
 - Bybit available margin
-- Bot trading limit ($100 by default)
-- Protected-capital ledger: base $10 / locked profit / current trading capital
+- Bot trading limit ($10,000 by default)
+- Protected-capital ledger: base $10,000 / locked profit / current trading capital
 - Budget currently available to the bot
 - Margin reserved by open positions
 - Open/unrealized P&L
@@ -53,10 +53,10 @@ Set these only as Render environment variables:
 - `BYBIT_DEMO_API_SECRET`
 - `AUTO_ENABLED=false
 - `AUTO_INTERVAL_SEC=60``
-- `DEMO_TRADING_BUDGET=100`
+- `DEMO_TRADING_BUDGET=10000`
 - `DEMO_MAX_DAILY_LOSS=20`
 - `DEMO_RISK_PCT=2`
-- `BOT_BASE_CAPITAL=10`
+- `BOT_BASE_CAPITAL=10000`
 - `PROFIT_LOCK_STEP=5`
 
 No API secrets belong in the repository.
@@ -165,9 +165,29 @@ Demo execution fix: Bybit retCode 110043 (leverage already set / unchanged) is t
 - If AUTO collides with a manual diagnostic scan, it is now queued and starts immediately after the manual scan releases the lock instead of simply disappearing for the next interval.
 
 
-## v6.1.2
+## v6.1.3
 - Fixed Demo sync/open-position UI null-element bug.
 - Open positions now render with Trade Monitor decision, P&L, Entry/Mark, SL/TP, leverage and Market close.
 - Added persistent AUTO trading controls: max positions, risk %, leverage, total open risk %, and AUTO interval.
 - AUTO and manual Demo entries use the saved risk/leverage settings.
 - Leverage mode uses automatic per-symbol cap when the requested leverage exceeds Bybit limits.
+
+
+## v6.1.3 — AUTO Execution Fix
+
+- `risk_pct` is configurable from 0 to 50% in the API/UI validation and paper engine.
+- AUTO in Demo/Live now reports explicit precheck blocks instead of a generic scan-complete message.
+- NORMAL + SCALP diagnostics report signal count, OPEN-gate count, opened orders and rejection reasons.
+- `/api/auto` now exposes `last_diagnostics` from the AUTO execution cycle.
+- Paper AUTO uses the configured `MAX_POSITIONS` value correctly (fixed missing import/reference).
+- Paper and exchange AUTO both expose rejection diagnostics.
+- Existing full-market scanner, Demo REST execution, server-side SL/TP, Trade Monitor and Learning Engine are retained from v6.1.2.
+- `TOTAL_OPEN_RISK_PCT` remains configurable; the default remains 8%. If the aggregate open-risk limit is reached, AUTO blocks the new entry and reports the reason rather than bypassing the risk control.
+
+### Validation
+
+The v6.1.3 package was compiled and the existing test suite passed: **41 tests passed**.
+
+### Render
+
+The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-market scanning, 10x leverage, 8 max positions and a 60-second AUTO interval. API keys must be supplied as Render environment variables and are not included in the archive.

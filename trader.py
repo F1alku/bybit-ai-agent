@@ -1,5 +1,5 @@
 import os, time
-from engine import MODE, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market
+from engine import MODE, MAX_POSITIONS, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market
 
 STRATEGY_DEFAULT = os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both'
 
@@ -57,17 +57,25 @@ def run_auto_cycle():
 
     if MODE in ('demo', 'live'):
         state = demo_state()
-        if not state.get('configured'): return None, 'Exchange API not configured', None
-        if state.get('error'): return None, 'Exchange sync error', None
-        if state.get('risk_locked'): return None, 'risk lock active — no new exchange entry', None
+        if not state.get('configured'):
+            return None, 'AUTO BLOCKED: Exchange API not configured', {'stage':'precheck','reason':'api_not_configured'}
+        if state.get('error'):
+            return None, f"AUTO BLOCKED: Exchange sync error — {state.get('error')}", {'stage':'precheck','reason':'exchange_sync'}
+        if state.get('risk_locked'):
+            return None, 'AUTO BLOCKED: daily risk lock active — no new exchange entry', {'stage':'precheck','reason':'daily_risk_lock'}
         positions = state.get('positions', [])
-        if len(positions) >= max_positions: return None, f'max {max_positions} exchange positions — monitoring', None
+        if len(positions) >= max_positions:
+            return None, f'AUTO BLOCKED: max {max_positions} exchange positions — monitoring', {'stage':'precheck','reason':'max_positions','open_positions':len(positions),'max_positions':max_positions}
         scans = {m: scan_mode(m) for m in modes}
         candidates=[]
+        candidate_stats={m:{'signals':0,'openable':0} for m in modes}
         for m,r in scans.items():
             gate = int(r.get('entry_threshold', 70 if m=='normal' else 60))
             for x in r.get('results', []):
+                if x.get('direction') in ('LONG','SHORT') and float(x.get('score',0)) >= gate:
+                    candidate_stats[m]['signals'] += 1
                 if x.get('direction') in ('LONG','SHORT') and float(x.get('score',0)) >= gate and x.get('stop_loss') and x.get('take_profit') and x.get('decision') == f"OPEN {x.get('direction')}":
+                    candidate_stats[m]['openable'] += 1
                     y=dict(x); y['strategy']=m; candidates.append(y)
         # Same symbol is one position in one-way mode; keep the stronger score.
         best={}
@@ -85,18 +93,34 @@ def run_auto_cycle():
         result = scans[modes[0]] if len(modes)==1 else {'ok':True,'mode':MODE,'strategy':'both','scans':scans,'results':sum([r.get('results',[]) for r in scans.values()],[])}
         prefix='AUTO LIVE' if MODE=='live' else 'AUTO DEMO'
         action=f"{prefix}: {', '.join(opened)}" if opened else 'scan complete — no exchange entry'
-        if rejected and not opened: action += f" • {rejected[0]}"
-        return result, action, None
+        if rejected: action += f" • rejected: {rejected[0]}"
+        diagnostics={
+            'stage':'execution',
+            'candidate_stats':candidate_stats,
+            'candidates':len(candidates),
+            'opened':len(opened),
+            'rejected':rejected[:20],
+            'open_positions_before':len(positions),
+            'max_positions':max_positions,
+            'risk_pct':risk_pct,
+            'leverage':leverage,
+        }
+        return result, action, diagnostics
 
     paper_mark_to_market()
     state=paper_state()
-    if state.get('risk_locked'): return None,'risk lock active — no paper entry',None
-    if len(state.get('open',[])) >= max_positions: return None,f'max {max_positions} paper positions — monitoring',None
+    if state.get('risk_locked'):
+        return None,'AUTO BLOCKED: paper daily risk lock active — no new entry',{'stage':'precheck','reason':'daily_risk_lock'}
+    if len(state.get('open',[])) >= max_positions:
+        return None,f'AUTO BLOCKED: max {max_positions} paper positions — monitoring',{'stage':'precheck','reason':'max_positions','open_positions':len(state.get('open',[])),'max_positions':max_positions}
     scans={m:scan_mode(m) for m in modes}
     candidates=[]
+    candidate_stats={m:{'signals':0,'openable':0} for m in modes}
     for m,r in scans.items():
         gate=int(r.get('entry_threshold',70 if m=='normal' else 60))
         for x in r.get('results',[]):
+            if x.get('direction') in ('LONG','SHORT') and float(x.get('score',0)) >= gate:
+                candidate_stats[m]['signals'] += 1
             if x.get('direction') in ('LONG','SHORT') and float(x.get('score',0)) >= gate and x.get('stop_loss') and x.get('take_profit') and x.get('decision')==f"OPEN {x.get('direction')}":
                 y=dict(x); y['strategy']=m; candidates.append(y)
     best={}
@@ -111,8 +135,18 @@ def run_auto_cycle():
         except ValueError as e: rejected.append(f"{x['symbol']}: {e}")
     result=scans[modes[0]] if len(modes)==1 else {'ok':True,'mode':MODE,'strategy':'both','scans':scans,'results':sum([r.get('results',[]) for r in scans.values()],[])}
     action='AUTO PAPER: '+', '.join(opened) if opened else 'scan complete — no paper entry'
-    if rejected and not opened: action += f" • {rejected[0]}"
-    return result,action,None
+    if rejected: action += f" • rejected: {rejected[0]}"
+    diagnostics={
+        'stage':'execution',
+        'candidate_stats':candidate_stats,
+        'candidates':len(best),
+        'opened':len(opened),
+        'rejected':rejected[:20],
+        'open_positions_before':len(state.get('open',[])),
+        'max_positions':max_positions,
+        'risk_pct':risk_pct,
+    }
+    return result,action,diagnostics
 
 
 def worker_loop(interval=60):

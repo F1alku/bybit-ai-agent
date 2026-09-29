@@ -1360,7 +1360,7 @@ def paper_open(d):
     if side not in ('LONG', 'SHORT'): raise ValueError('side must be LONG or SHORT')
     if not symbol.endswith('USDT'): raise ValueError('symbol must be a USDT perpetual')
     if entry <= 0 or sl <= 0 or tp <= 0: raise ValueError('prices must be positive')
-    if not 0 < risk_pct <= 5: raise ValueError('risk_pct must be between 0 and 5')
+    if not 0 < risk_pct <= 50: raise ValueError('risk_pct must be between 0 and 50')
     if side == 'LONG' and not (sl < entry < tp): raise ValueError('LONG requires SL < entry < TP')
     if side == 'SHORT' and not (tp < entry < sl): raise ValueError('SHORT requires TP < entry < SL')
     with _lock:

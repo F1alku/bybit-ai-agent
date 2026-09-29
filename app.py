@@ -24,7 +24,7 @@ scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
 strategy_state = {'mode': os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
-auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('AUTO_ENABLED','false').lower() == 'true' else '0'))), 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0, 'last_duration_sec': None, 'pending': False}
+auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('AUTO_ENABLED','false').lower() == 'true' else '0'))), 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0, 'last_duration_sec': None, 'pending': False, 'last_diagnostics': None}
 
 def _apply_trading_settings():
     import engine
@@ -61,7 +61,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.2', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.3', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -91,11 +91,12 @@ def _auto_iteration():
         return
     started = time.time()
     try:
-        result, action, _ = run_auto_cycle()
+        result, action, diagnostics = run_auto_cycle()
         with auto_lock:
             auto_state['last_run'] = time.time()
             auto_state['last_scan'] = result
             auto_state['last_action'] = action
+            auto_state['last_diagnostics'] = diagnostics
             auto_state['error'] = None
             if result is not None:
                 auto_state['last_success'] = time.time()
@@ -104,6 +105,7 @@ def _auto_iteration():
         with auto_lock:
             auto_state['last_run'] = time.time()
             auto_state['last_action'] = 'scan error'
+            auto_state['last_diagnostics'] = {'stage':'exception','error':str(e)}
             auto_state['error'] = str(e)
             auto_state['last_duration_sec'] = round(time.time() - started, 2)
     finally:
@@ -137,7 +139,7 @@ class PaperOpenRequest(BaseModel):
     entry: float
     stop_loss: float
     take_profit: float
-    risk_pct: float = Field(2.0, gt=0, le=5)
+    risk_pct: float = Field(2.0, gt=0, le=50)
 
 @app.get('/')
 def index(): return FileResponse('static/index.html')
@@ -145,7 +147,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.2', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.3', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -218,7 +220,7 @@ def update_bot_capital(req: BotCapitalRequest):
 
 class TradingConfigRequest(BaseModel):
     max_positions: int = Field(..., ge=1, le=20)
-    risk_pct: float = Field(..., gt=0, le=5)
+    risk_pct: float = Field(..., gt=0, le=50)
     leverage: float = Field(..., ge=1, le=100)
     total_open_risk_pct: float = Field(..., gt=0, le=50)
     auto_interval_sec: int = Field(..., ge=30, le=600)
