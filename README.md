@@ -1,3 +1,9 @@
+# v6.1.21 — Learning Sync Fix
+
+Fixes learning from Bybit Closed PnL: execId/orderId mismatches now use symbol/side/entry-price fallback. Closed trades without saved entry context still create outcome lessons instead of disappearing.
+
+History remains PostgreSQL-backed and Liquidity Intelligence remains restricted to open positions only.
+
 
 
 ## v6.1.20 Unified History + Liquidity Intelligence — Open Positions Only

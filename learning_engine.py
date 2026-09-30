@@ -139,22 +139,45 @@ def record_lessons_from_closed(limit=1000):
         cols = ['external_id','mode','symbol','side','strategy','score','risk_pct','planned_risk','market_regime','entry_timing','news_impact']
         meta = {str(r[0]): dict(zip(cols, r)) for r in cur.fetchall()}
     aliases = aliases_for_orders([r.get('external_id') for r in rows])
+    # Build secondary indexes because Bybit Closed PnL may use execId/orderId
+    # different from the orderId captured at entry.
+    meta_by_symbol_side = {}
+    for mk, mv in meta.items():
+        meta_by_symbol_side.setdefault((str(mv.get('symbol') or ''), str(mv.get('side') or '').upper()), []).append((mk, mv))
     lessons=[]
     for r in rows:
         key=str(r['external_id']); m=meta.get(key)
         if not m and aliases.get(key): m=meta.get(str(aliases[key]))
-        if not m: continue
-        net=float(r.get('net_pnl') or 0); planned=float(m.get('planned_risk') or 0)
+        # Fallback: match the most recent entry context for the same symbol/side
+        # and (when available) entry price. This covers execId-vs-orderId drift.
+        if not m:
+            candidates = meta_by_symbol_side.get((str(r.get('symbol') or ''), str(r.get('side') or '').upper()), [])
+            ep=float(r.get('entry_price') or 0)
+            if ep:
+                close=[(mk,mv) for mk,mv in candidates if abs(float(mv.get('entry_price') or 0)-ep) <= max(abs(ep)*1e-6, 1e-12)]
+                if close: candidates=close
+            if candidates:
+                m=max(candidates, key=lambda x: float(x[1].get('captured_at') or 0))[1]
+        net=float(r.get('net_pnl') or 0); planned=float(m.get('planned_risk') or 0) if m else 0
         outcome='WIN' if net>0 else 'LOSS' if net<0 else 'BREAKEVEN'
         r_mult=(net/planned) if planned>0 else None; score=float(m.get('score') or 0)
         right=[]; wrong=[]
         if net>0: right.append('Сделка закрылась в плюс после учёта комиссии.')
         elif net<0: wrong.append('Сделка закрылась в минус после учёта комиссии.')
-        if score>=80 and net<=0: wrong.append(f'Высокий входной score {score:g} не подтвердился результатом.')
-        if score<70 and net>0: right.append(f'Движение подтвердилось несмотря на score {score:g}.')
-        lesson=f"{outcome}: {m.get('symbol','?')} {m.get('side','?')}, {m.get('strategy','?')}, net P&L {net:+.4f} USDT"
+        if m:
+            if score>=80 and net<=0: wrong.append(f'Высокий входной score {score:g} не подтвердился результатом.')
+            if score<70 and net>0: right.append(f'Движение подтвердилось несмотря на score {score:g}.')
+            strategy=str(m.get('strategy') or 'UNKNOWN')
+            symbol=str(m.get('symbol') or r.get('symbol') or '?')
+            side=str(m.get('side') or r.get('side') or '?')
+            lesson=f"{outcome}: {symbol} {side}, {strategy}, net P&L {net:+.4f} USDT"
+        else:
+            symbol=str(r.get('symbol') or '?'); side=str(r.get('side') or '?')
+            strategy='UNKNOWN'
+            wrong.append('Контекст входа не найден; сохранён результат Bybit для последующего обучения.')
+            lesson=f"{outcome}: {symbol} {side}, контекст входа не найден, net P&L {net:+.4f} USDT."
         if r_mult is not None: lesson+=f", результат {r_mult:+.2f}R"
-        lesson+=f". Контекст: regime={m.get('market_regime') or 'UNKNOWN'}, timing={m.get('entry_timing') or 'UNKNOWN'}, news={m.get('news_impact') or 'UNKNOWN'}."
+        lesson+=f". Контекст: regime={(m.get('market_regime') if m else None) or 'UNKNOWN'}, timing={(m.get('entry_timing') if m else None) or 'UNKNOWN'}, news={(m.get('news_impact') if m else None) or 'UNKNOWN'}."
         row=(key,str(m.get('mode') or r.get('mode') or ''),str(m.get('symbol') or r.get('symbol') or ''),str(m.get('side') or r.get('side') or ''),str(m.get('strategy') or ''),outcome,net,r_mult,score,planned,lesson,' '.join(right),' '.join(wrong),time.time())
         with _lock, _conn() as c:
             cur=c.cursor()
