@@ -1092,14 +1092,23 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
     if constraints['min_notional'] > 0 and entry * qty < constraints['min_notional']:
         min_qty_for_notional = constraints['min_notional'] / entry
         qty_candidate = math.ceil(min_qty_for_notional / qty_step) * qty_step if qty_step else min_qty_for_notional
+        # Never allow a minimum-notional adjustment to undo the exchange max.
+        if max_qty > 0 and qty_candidate > max_qty + 1e-12:
+            raise ValueError(f'minimum Bybit order value {constraints["min_notional"]:g} USDT exceeds market max quantity {max_qty:g} for {symbol}')
         candidate_risk = qty_candidate * dist
         if candidate_risk > risk_cash * 1.000001:
             raise ValueError(f'minimum Bybit order value {constraints["min_notional"]:g} USDT requires risk ${candidate_risk:.2f}, above allowed ${risk_cash:.2f}')
         qty = qty_candidate
+    # Final exchange-limit guard after every quantity adjustment.
+    if max_qty > 0:
+        qty = min(qty, max_qty)
+        qty = _round_step(qty, qty_step) if qty_step else qty
     margin = entry * qty / leverage
     if margin > budget * MAX_MARGIN_FRACTION:
         qty = _round_step((budget * MAX_MARGIN_FRACTION * leverage) / entry, qty_step) if qty_step else (budget * MAX_MARGIN_FRACTION * leverage) / entry
         margin = entry * qty / leverage
+    if max_qty > 0 and qty > max_qty + 1e-12:
+        raise ValueError(f'calculated market quantity {qty:g} exceeds Bybit max {max_qty:g} for {symbol}')
     actual_risk = qty * dist
     if actual_risk > risk_cash * 1.000001:
         raise ValueError(f'position risk ${actual_risk:.2f} exceeds allowed ${risk_cash:.2f}')
@@ -1159,6 +1168,11 @@ def demo_open(d):
         {'category':'linear','symbol':symbol,'buyLeverage':str(leverage),'sellLeverage':str(leverage)},
         allow_ret_codes={110043},
     )
+    # Last-chance guard: the order being sent is Market, so qty must never exceed
+    # Bybit's market-order limit even if future sizing code changes.
+    _step, _min_qty, _max_market_qty = _symbol_rules(symbol)
+    if _max_market_qty > 0 and qty > _max_market_qty + 1e-12:
+        raise ValueError(f'order blocked locally: market qty {qty:g} > Bybit max { _max_market_qty:g} for {symbol}')
     order = {
         'category':'linear','symbol':symbol,'side':'Buy' if side == 'LONG' else 'Sell','orderType':'Market','qty':str(qty),
         'positionIdx':0,'reduceOnly':False,'takeProfit':str(tp),'stopLoss':str(sl),
@@ -1546,6 +1560,12 @@ def _round_step(value, step):
     return math.floor(value / step) * step
 
 def _symbol_rules(symbol):
+    """Return qty step, minimum qty, and the MAXIMUM MARKET order qty.
+
+    Bybit exposes separate limits for limit and market orders. Opens in this
+    agent are Market orders, so maxOrderQty is not sufficient. Prefer
+    maxMktOrderQty and fall back to maxOrderQty for older/alternate payloads.
+    """
     try:
         source = instruments()
     except Exception:
@@ -1553,7 +1573,12 @@ def _symbol_rules(symbol):
     for x in source:
         if x.get('symbol') == symbol:
             lot = x.get('lotSizeFilter') or {}
-            return float(lot.get('qtyStep') or 0), float(lot.get('minOrderQty') or 0), float(lot.get('maxOrderQty') or 0)
+            step = float(lot.get('qtyStep') or 0)
+            minimum = float(lot.get('minOrderQty') or 0)
+            max_market = float(lot.get('maxMktOrderQty') or 0)
+            if max_market <= 0:
+                max_market = float(lot.get('maxOrderQty') or 0)
+            return step, minimum, max_market
     return 0.0, 0.0, 0.0
 
 def _symbol_constraints(symbol):

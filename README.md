@@ -238,3 +238,11 @@ The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-mar
 - UI shows thesis health 0-100 plus reasons to continue and reasons to exit.
 - Strong setups expose a scale-in recommendation; size is NOT blindly increased without a separate risk-budget check.
 - Hard SL remains active.
+
+
+## v6.1.13 market quantity hard fix
+- Market opens use Bybit `maxMktOrderQty` (fallback `maxOrderQty`).
+- Final qty guard runs immediately before `/v5/order/create`.
+- Minimum-notional adjustment can no longer exceed the market max.
+- Qty is re-rounded to `qtyStep` after every cap.
+- Orders above the exchange market limit are blocked locally with a readable reason.

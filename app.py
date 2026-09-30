@@ -23,6 +23,7 @@ scan_lock = threading.Lock()
 scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
+manual_scan_pending = None
 strategy_state = {'mode': os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
 auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('AUTO_ENABLED','false').lower() == 'true' else '0'))), 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0, 'last_duration_sec': None, 'pending': False, 'last_diagnostics': None}
 
@@ -72,7 +73,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.12', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.14', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -88,6 +89,31 @@ async def json_error_middleware(request, call_next):
             'error_type': e.__class__.__name__,
             'path': request.url.path,
         })
+
+
+def _start_pending_manual_scan():
+    """Start one queued manual scan after AUTO/current scan releases the lock."""
+    global manual_scan_pending
+    with scan_jobs_lock:
+        pending = manual_scan_pending
+        manual_scan_pending = None
+    if not pending:
+        return
+    job_id, interval, limit_symbols, entry_threshold, strategy, full_market = pending
+    if not scan_lock.acquire(blocking=False):
+        # Extremely short race with another cycle; put it back for the next release.
+        with scan_jobs_lock:
+            manual_scan_pending = pending
+        return
+    try:
+        with scan_jobs_lock:
+            if job_id in scan_jobs:
+                scan_jobs[job_id]['status'] = 'running'
+        scan_executor.submit(_run_scan_job, job_id, interval, limit_symbols, entry_threshold, strategy, full_market)
+    except Exception as e:
+        scan_lock.release()
+        with scan_jobs_lock:
+            scan_jobs[job_id] = {'status':'error','error':f'Не удалось поставить скан в очередь: {e}','error_type':e.__class__.__name__}
 
 
 def _auto_iteration():
@@ -121,6 +147,7 @@ def _auto_iteration():
             auto_state['last_duration_sec'] = round(time.time() - started, 2)
     finally:
         scan_lock.release()
+        _start_pending_manual_scan()
 
 
 async def _auto_loop():
@@ -158,7 +185,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.8', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.14', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -301,6 +328,7 @@ def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy, fu
             scan_jobs[job_id] = {'status': 'error', 'error': str(e), 'error_type': e.__class__.__name__}
     finally:
         scan_lock.release()
+        _start_pending_manual_scan()
         with auto_lock:
             should_run_auto = bool(auto_state.get('enabled') and auto_state.get('pending'))
             if should_run_auto:
@@ -311,11 +339,24 @@ def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy, fu
 
 @app.post('/api/scan')
 def scan(req: ScanRequest):
-    if not scan_lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail='Скан уже выполняется. Подожди завершения текущего цикла.')
+    global manual_scan_pending
     job_id = uuid.uuid4().hex[:12]
     with scan_jobs_lock:
-        scan_jobs[job_id] = {'status': 'running', 'interval': req.interval, 'limit_symbols': req.limit_symbols}
+        scan_jobs[job_id] = {'status': 'queued', 'interval': req.interval, 'limit_symbols': req.limit_symbols}
+    # If AUTO/current scan owns the lock, queue exactly one manual request instead
+    # of returning a permanent 409. The request starts immediately after the
+    # current cycle releases the lock. This prevents the UI from getting stuck
+    # on "scan already running" when AUTO is enabled.
+    if not scan_lock.acquire(blocking=False):
+        with scan_jobs_lock:
+            if manual_scan_pending is not None:
+                scan_jobs[job_id] = {'status':'error','error':'Другой ручной скан уже стоит в очереди.','error_type':'ScanAlreadyQueued'}
+                return {'ok': True, 'job_id': job_id, 'status': 'error'}
+            manual_scan_pending = (job_id, req.interval, req.limit_symbols, strategy_state['scalp_gate'] if strategy_state['mode']=='scalp' else strategy_state['normal_gate'], strategy_state['mode'], bool(req.full_market and req.limit_symbols == 0))
+            scan_jobs[job_id]['queued_behind'] = 'current AUTO/manual scan'
+        return {'ok': True, 'job_id': job_id, 'status': 'queued'}
+    with scan_jobs_lock:
+        scan_jobs[job_id]['status'] = 'running'
         # Keep only the newest 20 job records so a long-lived Render instance cannot grow memory forever.
         if len(scan_jobs) > 20:
             for old_id in list(scan_jobs)[:-20]:
