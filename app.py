@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position, trade_monitor_snapshot, bot_capital_config, set_bot_capital
 from journal import init_db, recent as journal_recent, sync_closed_pnl, sync_closed_pnl_detailed, get_setting, set_setting, db_status
-from learning_engine import build_learning_report, init_learning_db, record_lessons_from_closed, recent_lessons
+from learning_engine import build_learning_report, init_learning_db, record_lessons_from_closed, recent_lessons, learning_counts
 from news_engine import snapshot as news_snapshot
 from liquidity_engine import status as liquidity_status
 from trader import run_auto_cycle
@@ -44,7 +44,7 @@ def _apply_trading_settings():
 _apply_trading_settings()
 
 _history_sync_task = None
-_history_sync_state = {"last_run": None, "last_ok": None, "synced": 0, "exchange_closed_count": 0, "errors": [], "learning_errors": []}
+_history_sync_state = {"last_run": None, "last_ok": None, "synced": 0, "exchange_closed_count": 0, "errors": [], "learning_errors": [], "learning_sync": {}}
 
 async def _history_sync_loop():
     """Continuously reconcile Bybit Closed PnL into the durable journal.
@@ -64,7 +64,9 @@ async def _history_sync_loop():
                     "learning_errors": [],
                 })
                 try:
-                    record_lessons_from_closed(1000)
+                    learning_result = record_lessons_from_closed(1000)
+                    _history_sync_state["learning_sync"] = {k: learning_result.get(k, 0) for k in ('created_or_updated','lesson_total','closed_rows','matched_context','unmatched_context','match_methods','failed_rows','pending','errors')}
+                    _history_sync_state["learning_errors"] = list(learning_result.get('errors', []))[:5]
                 except Exception as le:
                     _history_sync_state["learning_errors"] = [str(le)[:300]]
         except Exception as e:
@@ -84,7 +86,9 @@ async def lifespan(_app):
             result = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(500))
             _history_sync_state.update({"last_run": time.time(), "last_ok": not bool(result.get("errors")), "synced": int(result.get("synced", 0)), "exchange_closed_count": int(result.get("exchange_closed_count", 0)), "errors": list(result.get("errors", [])), "learning_errors": []})
             try:
-                record_lessons_from_closed(1000)
+                learning_result = record_lessons_from_closed(1000)
+                _history_sync_state["learning_sync"] = {k: learning_result.get(k, 0) for k in ('created_or_updated','lesson_total','closed_rows','matched_context','unmatched_context','match_methods','failed_rows','pending','errors')}
+                _history_sync_state["learning_errors"] = list(learning_result.get('errors', []))[:5]
             except Exception as le:
                 _history_sync_state["learning_errors"] = [str(le)[:300]]
         except Exception as e:
@@ -114,7 +118,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.26', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.27', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -200,7 +204,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.26', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.27', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -445,9 +449,11 @@ def learning():
 @app.get('/api/learning/lessons')
 def learning_lessons():
     try:
-        # Backfill is DB-only here. No Bybit request is allowed on a page read.
-        sync = record_lessons_from_closed(1000)
-        return {'ok': True, 'durable_journal': bool(db_status().get('durable')), 'lesson_sync': {k: sync.get(k, 0) for k in ('created_or_updated','lesson_total','closed_rows','matched_context','unmatched_context','match_methods')}, 'lessons': recent_lessons(100)}
+        # Page reads are DB-only. Backfill is owned by the background worker.
+        counts = learning_counts()
+        sync = dict(_history_sync_state.get('learning_sync') or {})
+        sync.update(counts)
+        return {'ok': True, 'durable_journal': bool(db_status().get('durable')), 'lesson_sync': sync, 'lessons': recent_lessons(100)}
     except Exception as e:
         return {'ok': False, 'lessons': [], 'error': str(e)}
 
@@ -476,13 +482,15 @@ def journal():
         # The background history loop owns exchange reconciliation; this endpoint
         # serves durable PostgreSQL/SQLite state immediately.
         db = db_status()
-        trades = journal_recent(100)
-        try:
-            learning_sync = record_lessons_from_closed(1000)
-            lessons = recent_lessons(50)
-        except Exception as e:
-            learning_sync = {'closed_rows': len(trades), 'created_or_updated': 0, 'matched_context': 0, 'unmatched_context': len(trades), 'errors': [str(e)]}
-            lessons = []
+        trades = journal_recent(50)
+        counts = learning_counts()
+        learning_sync = dict(_history_sync_state.get('learning_sync') or {})
+        learning_sync.update({
+            'closed_rows': int(counts.get('closed_rows', 0)),
+            'lesson_total': int(counts.get('lesson_total', 0)),
+            'pending': int(counts.get('pending', 0)),
+        })
+        lessons = recent_lessons(50)
         return {
             'ok': True, 'mode': MODE, 'durable_journal': bool(db.get('durable')),
             'db_backend': db.get('backend'), 'db_error': db.get('error'),

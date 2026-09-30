@@ -1,8 +1,8 @@
-# Bybit AI Agent v6.1.26 — Performance + Learning
+# Bybit AI Agent v6.1.27 — Performance + Learning
 
 Based on v6.1.25. Demo-first autonomous Bybit USDT Perpetual agent.
 
-## v6.1.26 changes
+## v6.1.27 changes
 - History API is now DB-first: `/api/journal` never calls Bybit.
 - Learning lessons are read/backfilled from the durable journal without exchange calls from page requests.
 - Background Closed PnL reconciliation remains the only exchange-to-history sync path.
@@ -18,3 +18,10 @@ Based on v6.1.25. Demo-first autonomous Bybit USDT Perpetual agent.
 - Python compile check: passed.
 - JavaScript syntax check with Node: passed.
 - Full test suite: **58 passed**.
+
+
+## v6.1.27 Learning reliability
+- Learning backfill is background-only; page/API reads never trigger DB-backfill.
+- Each historical row is isolated with a savepoint, so one malformed row cannot stop the remaining lessons.
+- `/api/journal` reports durable `lesson_total`, `pending`, and Learning errors.
+- `/api/learning` reads persisted lessons/counts and does not rebuild them during page load.
