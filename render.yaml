@@ -18,7 +18,7 @@ services:
       - key: RUN_TRADER_IN_WEB
         value: 'true'
       - key: DEMO_TRADING_BUDGET
-        value: '10000'
+        value: '100'
       - key: MAX_POSITIONS
         value: '8'
       - key: DEFAULT_LEVERAGE
@@ -26,21 +26,21 @@ services:
       - key: LEVERAGE_MODE
         value: auto
       - key: TOTAL_OPEN_RISK_PCT
-        value: '8'
+        value: '10'
       - key: FULL_MARKET_DEFAULT
         value: 'true'
       - key: FULL_MARKET_WORKERS
-        value: '6'
+        value: '16'
       - key: AUTO_INTERVAL_SEC
-        value: '60'
-      - key: FULL_MARKET_DEEP_CANDIDATES
         value: '30'
+      - key: FULL_MARKET_DEEP_CANDIDATES
+        value: '12'
       - key: DEMO_MAX_DAILY_LOSS
         value: '20'
       - key: DEMO_RISK_PCT
-        value: '2'
+        value: '10'
       - key: BOT_BASE_CAPITAL
-        value: '10000'
+        value: '100'
       - key: PROFIT_LOCK_STEP
         value: '5'
       - key: BOT_CAPITAL_MIN
@@ -65,15 +65,15 @@ services:
       - key: AUTO_ENABLED
         value: 'false'
       - key: DEMO_TRADING_BUDGET
-        value: '10000'
+        value: '100'
       - key: AUTO_INTERVAL_SEC
-        value: '60'
+        value: '30'
       - key: DEMO_MAX_DAILY_LOSS
         value: '20'
       - key: DEMO_RISK_PCT
-        value: '2'
+        value: '10'
       - key: BOT_BASE_CAPITAL
-        value: '10000'
+        value: '100'
       - key: PROFIT_LOCK_STEP
         value: '5'
       - key: BOT_CAPITAL_MIN
@@ -87,7 +87,7 @@ services:
       - key: LEVERAGE_MODE
         value: auto
       - key: TOTAL_OPEN_RISK_PCT
-        value: '8'
+        value: '10'
       - key: STRATEGY_MODE
         value: both
       - key: DATABASE_URL

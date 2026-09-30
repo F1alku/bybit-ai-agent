@@ -2,7 +2,7 @@
 
 This module learns from CLOSED trades only. It never changes strategy parameters
 or opens/closes positions by itself. It produces statistical insights and
-optional, human-reviewable recommendations.
+a bounded adaptive score adjustment based on closed-trade evidence. It never changes risk limits and never opens/closes a position by itself.
 """
 import math
 import time
@@ -255,6 +255,8 @@ def record_lessons_from_closed(limit=1000):
             except Exception as e:
                 if len(errors) < 20:
                     errors.append(f'{key or "<empty>"}: {str(e)[:240]}')
+    if lessons:
+        _adaptive_cache['at']=0.0
     total=_learning_lesson_count()
     return {'created_or_updated':len(lessons),'lesson_total':total,'closed_rows':len(rows),'matched_context':matched,'unmatched_context':unmatched,'match_methods':match_methods,'errors':errors,'failed_rows':len(errors),'pending':max(0,len(rows)-len(lessons)),'lessons':lessons}
 
@@ -269,6 +271,46 @@ def recent_lessons(limit=50):
         else:
             cur.execute('SELECT external_id,mode,symbol,side,strategy,outcome,net_pnl,r_multiple,score,planned_risk,lesson,what_went_right,what_went_wrong,created_at FROM learning_lessons ORDER BY created_at DESC LIMIT ?',(int(limit),))
         return [dict(zip(cols,r)) for r in cur.fetchall()]
+
+
+_adaptive_cache = {"at": 0.0, "rows": []}
+
+
+def adaptive_adjustment(strategy=None, side=None, score=None):
+    """Return a small evidence-based score adjustment, capped at +/-5.
+
+    Learning is deliberately conservative: at least 8 closed lessons are needed,
+    and the adjustment is shrunk toward zero. This makes every closed trade useful
+    without allowing a short winning/losing streak to hijack the entry engine.
+    """
+    now=time.time()
+    if now - float(_adaptive_cache.get("at", 0)) > 60:
+        init_learning_db()
+        with _lock, _conn() as c:
+            cur=c.cursor()
+            cur.execute('SELECT strategy,side,score,outcome,net_pnl,r_multiple FROM learning_lessons ORDER BY created_at DESC LIMIT 1000')
+            _adaptive_cache["rows"]=[dict(zip(['strategy','side','score','outcome','net_pnl','r_multiple'],r)) for r in cur.fetchall()]
+            _adaptive_cache["at"]=now
+    rows=_adaptive_cache.get("rows",[])
+    filt=[]
+    for r in rows:
+        if strategy and str(r.get('strategy') or '').upper() != str(strategy).upper(): continue
+        if side and str(r.get('side') or '').upper() != str(side).upper(): continue
+        if score is not None:
+            try:
+                if abs(float(r.get('score') or 0)-float(score)) > 12: continue
+            except Exception: continue
+        filt.append(r)
+    if len(filt) < 8:
+        return {'adjustment':0.0,'samples':len(filt),'confidence':0.0,'basis':'insufficient_samples'}
+    wins=sum(1 for r in filt if str(r.get('outcome'))=='WIN')
+    wr=wins/len(filt)
+    avg_r=sum(float(r.get('r_multiple') or 0) for r in filt)/len(filt)
+    # Win-rate edge is the primary signal; R is a secondary stabilizer.
+    raw=((wr-0.5)*12.0) + max(-2.0,min(2.0,avg_r*1.5))
+    shrink=min(1.0, len(filt)/40.0)
+    adj=max(-5.0,min(5.0,raw*shrink))
+    return {'adjustment':round(adj,3),'samples':len(filt),'confidence':round(shrink,3),'win_rate_pct':round(wr*100,2),'avg_r':round(avg_r,3),'basis':'closed_trade_evidence'}
 
 
 def build_learning_report(limit=1000):

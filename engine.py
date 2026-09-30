@@ -26,25 +26,25 @@ LIVE_API_SECRET = os.getenv('BYBIT_LIVE_API_SECRET', '')
 LIVE_TRADING_ARMED = os.getenv('LIVE_TRADING_ARMED', 'false').lower() == 'true'
 TIMEOUT = 10.0
 # Keep REST safely below endpoint/UID limits. The scanner should prefer cache/WS over bursts.
-CACHE_TTL = 60.0
+CACHE_TTL = 30.0
 REST_MIN_INTERVAL_SEC = float(os.getenv('REST_MIN_INTERVAL_SEC', '0.12'))
 RETRY_COUNT = 2
 PRIVATE_RETRY_COUNT = 2
 DEMO_ACCOUNT_CACHE_TTL = 8.0
 DEMO_CLOSED_PNL_CACHE_TTL = 5.0
 MAX_POSITIONS = int(os.getenv('MAX_POSITIONS', '8'))
-RISK_PCT_DEFAULT = float(os.getenv('RISK_PCT_DEFAULT', '2'))
+RISK_PCT_DEFAULT = float(os.getenv('RISK_PCT_DEFAULT', '10'))
 LEVERAGE = float(os.getenv('DEFAULT_LEVERAGE', '10'))
 LEVERAGE_MODE = os.getenv('LEVERAGE_MODE', 'fixed').lower()
-TOTAL_OPEN_RISK_PCT = float(os.getenv('TOTAL_OPEN_RISK_PCT', '8'))
+TOTAL_OPEN_RISK_PCT = float(os.getenv('TOTAL_OPEN_RISK_PCT', '10'))
 START_BALANCE = 10.0
-DEMO_TRADING_BUDGET = float(os.getenv('DEMO_TRADING_BUDGET', '10000'))
+DEMO_TRADING_BUDGET = float(os.getenv('DEMO_TRADING_BUDGET', '100'))
 DEMO_MAX_DAILY_LOSS = float(os.getenv('DEMO_MAX_DAILY_LOSS', '20'))
-DEMO_RISK_PCT = float(os.getenv('DEMO_RISK_PCT', '2'))
+DEMO_RISK_PCT = float(os.getenv('DEMO_RISK_PCT', '10'))
 LIVE_TRADING_BUDGET = float(os.getenv('LIVE_TRADING_BUDGET', '100'))
 LIVE_MAX_DAILY_LOSS = float(os.getenv('LIVE_MAX_DAILY_LOSS', '20'))
-LIVE_RISK_PCT = float(os.getenv('LIVE_RISK_PCT', '2'))
-BOT_BASE_CAPITAL = float(os.getenv('BOT_BASE_CAPITAL', '10000'))
+LIVE_RISK_PCT = float(os.getenv('LIVE_RISK_PCT', '10'))
+BOT_BASE_CAPITAL = float(os.getenv('BOT_BASE_CAPITAL', '100'))
 PROFIT_LOCK_STEP = float(os.getenv('PROFIT_LOCK_STEP', '5'))
 BOT_CAPITAL_MIN = float(os.getenv('BOT_CAPITAL_MIN', '1'))
 BOT_CAPITAL_MAX = float(os.getenv('BOT_CAPITAL_MAX', '1000000'))
@@ -55,10 +55,10 @@ BOT_AVAILABLE_CAPITAL_MAX = float(os.getenv('BOT_AVAILABLE_CAPITAL_MAX', '100000
 # calls are reserved for a small ranked subset.
 TECH_CANDIDATES = int(os.getenv('TECH_CANDIDATES', '24'))
 DEEP_CANDIDATES = int(os.getenv('DEEP_CANDIDATES', '12'))
-MICRO_CANDIDATES = int(os.getenv('MICRO_CANDIDATES', '6'))
-FULL_MARKET_DEEP_CANDIDATES = int(os.getenv('FULL_MARKET_DEEP_CANDIDATES', '20'))
+MICRO_CANDIDATES = int(os.getenv('MICRO_CANDIDATES', '4'))
+FULL_MARKET_DEEP_CANDIDATES = int(os.getenv('FULL_MARKET_DEEP_CANDIDATES', '12'))
 FULL_MARKET_DEFAULT = os.getenv('FULL_MARKET_DEFAULT', 'true').lower() == 'true'
-FULL_MARKET_WORKERS = int(os.getenv('FULL_MARKET_WORKERS', '10'))
+FULL_MARKET_WORKERS = int(os.getenv('FULL_MARKET_WORKERS', '16'))
 INSTRUMENT_CACHE_TTL = 600.0
 DAILY_LOSS_LIMIT_PCT = float(os.getenv('DAILY_LOSS_LIMIT_PCT', '6'))
 MAX_CONSECUTIVE_LOSSES = 3
@@ -67,6 +67,8 @@ ENTRY_SCORE_MIN = 70
 ENTRY_RR_MIN = float(os.getenv('ENTRY_RR_MIN', '1.5'))
 SCALP_TIME_STOP_MIN = int(os.getenv('SCALP_TIME_STOP_MIN', '15'))
 MAX_MARGIN_FRACTION = 0.95
+MAX_RISK_PCT_PER_TRADE = 10.0
+MAX_ALLOCATION_CAPITAL_PCT = 80.0
 # Simulation assumptions only; change them when you know the fee/slippage model you want.
 PAPER_FEE_RATE = 0.00055
 PAPER_SLIPPAGE_RATE = 0.0002
@@ -498,6 +500,23 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None, ent
     elif funding < -0.0015:
         ss = max(0.0, ss - 3); reasons_short.append('funding crowded -3')
 
+    # Adaptive learning: closed trades can make a small evidence-based adjustment
+    # to the next entry. It is bounded and never replaces hard market gates.
+    learning_long = {'adjustment':0.0,'samples':0,'confidence':0.0}
+    learning_short = {'adjustment':0.0,'samples':0,'confidence':0.0}
+    try:
+        from learning_engine import adaptive_adjustment
+        learning_long = adaptive_adjustment(strategy=strategy, side='LONG', score=ls)
+        learning_short = adaptive_adjustment(strategy=strategy, side='SHORT', score=ss)
+        ls = max(0.0, min(100.0, ls + float(learning_long.get('adjustment') or 0)))
+        ss = max(0.0, min(100.0, ss + float(learning_short.get('adjustment') or 0)))
+        if abs(float(learning_long.get('adjustment') or 0)) >= 0.5:
+            reasons_long.append(f"adaptive learning {float(learning_long.get('adjustment')):+.1f}")
+        if abs(float(learning_short.get('adjustment') or 0)) >= 0.5:
+            reasons_short.append(f"adaptive learning {float(learning_short.get('adjustment')):+.1f}")
+    except Exception:
+        pass
+
     spread_bad = spread is not None and spread > 0.12
     if spread_bad:
         ls = max(0.0, ls - 8); ss = max(0.0, ss - 8)
@@ -583,6 +602,7 @@ def score(frames, setup='15', micro=None, live_price=None, btc_context=None, ent
         'reasons': reasons, 'long_score': round(min(100.0, ls), 1), 'short_score': round(min(100.0, ss), 1),
         'oi_change_pct': round(oi_chg, 2), 'orderbook_imbalance': round(ob_imb, 2), 'trade_delta_pct': round(delta, 2),
         'funding_rate': funding, 'spread_pct': round(spread, 4) if spread is not None else None,
+        'learning_adjustment_long': learning_long, 'learning_adjustment_short': learning_short,
         'scalp_time_stop_min': SCALP_TIME_STOP_MIN if strategy=='scalp' else None,
     }
 
@@ -952,16 +972,23 @@ def _bot_capital_state():
     if raw:
         try:
             state = json.loads(raw)
-            if state.get('version') in (1, 2, 3, 4):
-                # v6.1 standardizes the virtual Demo trading capital at $10,000.
-                # Migrate the old untouched $10 baseline once; afterwards the user
-                # controlled value is preserved. This prevents a restart/deploy from
-                # bringing the bot back to the old $10 default.
-                if state.get('version') in (1, 2) and float(state.get('base_capital', 0) or 0) == 10.0 and BOT_BASE_CAPITAL >= 10000:
-                    state['base_capital'] = round(min(max(float(BOT_BASE_CAPITAL), BOT_CAPITAL_MIN), BOT_CAPITAL_MAX), 8)
-                    state['trading_capital'] = state['base_capital']
-                    state['version'] = 3
+            if state.get('version') in (1, 2, 3, 4, 5):
+                # Final portfolio policy: $100 trading capital. Migrate only the
+                # old untouched defaults ($10 / $10,000), never an explicit custom
+                # amount chosen by the user.
+                base_existing = float(state.get('base_capital', 0) or 0)
+                if state.get('policy_version') != 1 and ((abs(base_existing-10000.0) < 1e-9) or (abs(base_existing-10.0) < 1e-9 and BOT_BASE_CAPITAL >= 100.0)):
+                    state['base_capital'] = 100.0
+                    state['trading_capital'] = 100.0
+                    state['locked_profit'] = 0.0
+                    state['available_capital_limit'] = 0.0
+                    state['version'] = 5
+                    state['policy_version'] = 1
                     state['last_capital_change_at'] = int(time.time() * 1000)
+                    set_setting('bot_capital_state', json.dumps(state, separators=(',', ':')))
+                elif state.get('policy_version') != 1:
+                    state['policy_version'] = 1
+                    state['version'] = 5
                     set_setting('bot_capital_state', json.dumps(state, separators=(',', ':')))
                 return state
         except Exception:
@@ -1118,7 +1145,7 @@ def _demo_available_usdt():
     return float(available or 0), float(equity or 0), result
 
 
-def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, return_details=False):
+def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, return_details=False, capital_allocation_pct=None):
     available, equity, _ = _demo_available_usdt()
     risk_pct = float(DEMO_RISK_PCT if (risk_pct is None and MODE == 'demo') else LIVE_RISK_PCT if risk_pct is None else risk_pct)
     positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
@@ -1126,6 +1153,8 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
     unrealized = sum(float(x.get('unrealisedPnl') or 0) for x in positions)
     cap = _bot_capital_view(unrealized_pnl=unrealized, reserved_margin=reserved_margin)
     budget = min(cap['bot_available_capital'], available)
+    if risk_pct > MAX_RISK_PCT_PER_TRADE + 1e-9:
+        raise ValueError('risk_pct cannot exceed 10% in final portfolio policy')
     risk_cash = min(equity, budget) * risk_pct / 100
     dist = abs(entry - sl)
     if dist <= 0: raise ValueError('invalid stop distance')
@@ -1142,6 +1171,13 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
             raise ValueError(f'minimum Bybit order value {constraints["min_notional"]:g} USDT requires risk ${candidate_risk:.2f}, above allowed ${risk_cash:.2f}')
         qty = qty_candidate
     margin = entry * qty / leverage
+    allocation_pct = float(capital_allocation_pct or 0.0)
+    if allocation_pct > 0:
+        allocation_cap = budget * min(MAX_ALLOCATION_CAPITAL_PCT, allocation_pct) / 100.0
+        if margin > allocation_cap:
+            qty = _round_step((allocation_cap * leverage) / entry, qty_step) if qty_step else (allocation_cap * leverage) / entry
+            margin = entry * qty / leverage
+            actual_risk = qty * dist
     if margin > budget * MAX_MARGIN_FRACTION:
         qty = _round_step((budget * MAX_MARGIN_FRACTION * leverage) / entry, qty_step) if qty_step else (budget * MAX_MARGIN_FRACTION * leverage) / entry
         margin = entry * qty / leverage
@@ -1198,7 +1234,7 @@ def demo_open(d):
     positions = [x for x in _demo_positions() if float(x.get('size') or 0) > 0]
     if len(positions) >= MAX_POSITIONS: raise ValueError(f'max {MAX_POSITIONS} demo positions')
     if any(x.get('symbol') == symbol for x in positions): raise ValueError('Position for this symbol already open')
-    qty, margin, available, equity, cap, leverage, constraints, actual_risk = _demo_risk_qty(symbol, entry, sl, d.get('leverage'), d.get('risk_pct'), return_details=True)
+    qty, margin, available, equity, cap, leverage, constraints, actual_risk = _demo_risk_qty(symbol, entry, sl, d.get('leverage'), d.get('risk_pct'), return_details=True, capital_allocation_pct=d.get('capital_allocation_pct'))
     daily_loss, locked = _demo_guard_status(equity)
     limit = DEMO_MAX_DAILY_LOSS if MODE == 'demo' else LIVE_MAX_DAILY_LOSS
     if locked: raise ValueError(f'Daily loss limit reached: ${daily_loss:.2f} / ${limit:.2f}')
@@ -1241,7 +1277,7 @@ def demo_open(d):
             pass
     except Exception:
         pass
-    return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'bot_capital':cap,'leverage':leverage,'actual_risk_usdt':actual_risk,'min_notional':constraints['min_notional'],'max_leverage':constraints['max_leverage'],'order':result}
+    return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'bot_capital':cap,'leverage':leverage,'actual_risk_usdt':actual_risk,'capital_allocation_pct':d.get('capital_allocation_pct'),'min_notional':constraints['min_notional'],'max_leverage':constraints['max_leverage'],'order':result}
 
 
 def _legacy_position_exit_analysis(p):
@@ -1396,6 +1432,75 @@ def _profit_lock_price(entry, qty, margin, side, lock_pct):
     delta = (margin * (lock_pct / 100.0)) / qty
     return entry + delta if side == 'Buy' else entry - delta
 
+def _pyramid_key(p, suffix):
+    return f"pyramid:{p.get('symbol')}:{p.get('side')}:{p.get('avgPrice')}:{suffix}"
+
+
+def demo_add_to_position(p, risk_pct=2.0, capital_allocation_pct=20.0):
+    """Add to a profitable existing position only when its thesis is strong.
+
+    This is pyramiding, not averaging: the position must already be profitable,
+    the hard SL must protect the existing thesis, and the new risk must fit the
+    remaining 10% portfolio risk budget. At most two adds are permitted per
+    original position.
+    """
+    if MODE not in ('demo','live'):
+        raise ValueError('exchange pyramiding is unavailable in paper mode')
+    symbol=str(p.get('symbol') or '').upper(); side=str(p.get('side') or '')
+    if not symbol or side not in ('Buy','Sell'): raise ValueError('invalid position for pyramiding')
+    mark=float(p.get('markPrice') or p.get('avgPrice') or 0); entry=float(p.get('avgPrice') or 0); sl=float(p.get('stopLoss') or 0)
+    upnl=float(p.get('unrealisedPnl') or 0); margin=abs(float(p.get('positionIM') or 0))
+    if mark<=0 or entry<=0 or sl<=0 or margin<=0: raise ValueError('pyramiding requires live entry, mark, margin and hard SL')
+    if (side=='Buy' and not (mark>entry and sl<mark)) or (side=='Sell' and not (mark<entry and sl>mark)):
+        raise ValueError('pyramiding is allowed only while the existing position is profitable and protected')
+    count=int(get_setting(_pyramid_key(p,'count'),'0') or 0)
+    if count>=2: raise ValueError('maximum two pyramiding adds reached')
+    last=float(get_setting(_pyramid_key(p,'last_at'),'0') or 0)
+    if last and time.time()-last < 300: raise ValueError('pyramiding cooldown active')
+
+    positions=[x for x in _demo_positions() if float(x.get('size') or 0)>0]
+    available,equity,_=_demo_available_usdt()
+    cap=_bot_capital_view(unrealized_pnl=sum(float(x.get('unrealisedPnl') or 0) for x in positions), reserved_margin=sum(abs(float(x.get('positionIM') or 0)) for x in positions))
+    budget=min(cap['bot_available_capital'],available)
+    existing_risk=0.0
+    for x in positions:
+        q=abs(float(x.get('size') or 0)); ep=float(x.get('avgPrice') or 0); sx=float(x.get('stopLoss') or 0)
+        if q>0 and ep>0 and sx>0: existing_risk += q*abs(ep-sx)
+    total_limit=min(equity,budget)*TOTAL_OPEN_RISK_PCT/100
+    remaining=max(0.0,total_limit-existing_risk)
+    requested_risk=min(budget*min(MAX_RISK_PCT_PER_TRADE,max(0.25,float(risk_pct)))/100.0, remaining*0.5)
+    if requested_risk<=0: raise ValueError('no portfolio risk budget remains for pyramiding')
+    dist=abs(mark-sl)
+    qty_step,min_qty,max_qty=_symbol_rules(symbol)
+    qty=requested_risk/dist
+    qty=_round_step(qty,qty_step) if qty_step else qty
+    if max_qty>0: qty=min(qty,max_qty)
+    allocation_cap=budget*min(MAX_ALLOCATION_CAPITAL_PCT,max(1.0,float(capital_allocation_pct)))/100.0
+    leverage,constraints=_effective_leverage(symbol,10.0)
+    margin_add=mark*qty/leverage
+    if margin_add>allocation_cap:
+        qty=_round_step(allocation_cap*leverage/mark,qty_step) if qty_step else allocation_cap*leverage/mark
+        margin_add=mark*qty/leverage
+    actual_risk=qty*dist
+    if actual_risk<=0 or actual_risk>remaining+1e-9: raise ValueError('pyramiding risk exceeds remaining portfolio budget')
+    if qty<=0 or (min_qty>0 and qty<min_qty): raise ValueError('pyramiding size is below exchange minimum')
+    bybit_private_post('/v5/position/set-leverage',{'category':'linear','symbol':symbol,'buyLeverage':str(leverage),'sellLeverage':str(leverage)},allow_ret_codes={110043})
+    order=bybit_private_post('/v5/order/create',{
+        'category':'linear','symbol':symbol,'side':side,'orderType':'Market','qty':str(qty),
+        'positionIdx':int(p.get('positionIdx') or 0),'reduceOnly':False,
+        'orderLinkId':f'ai-pyramid-{int(time.time()*1000)}'
+    })
+    set_setting(_pyramid_key(p,'count'),str(count+1)); set_setting(_pyramid_key(p,'last_at'),str(time.time()))
+    try:
+        from learning_engine import record_trade_meta
+        oid=(order or {}).get('orderId') if isinstance(order,dict) else None
+        record_trade_meta({'external_id':oid or f'ai-pyramid-{int(time.time()*1000)}','order_id':oid,'mode':MODE,'symbol':symbol,'side':'LONG' if side=='Buy' else 'SHORT','strategy':'PYRAMID','score':0,'risk_pct':actual_risk/max(cap.get('bot_equity',budget),1e-9)*100,'leverage':leverage,'planned_risk':actual_risk,'entry_price':mark,'stop_loss':sl,'take_profit':float(p.get('takeProfit') or 0)})
+    except Exception:
+        pass
+    _invalidate_demo_account_cache()
+    return {'ok':True,'action':'PYRAMID_ADD','symbol':symbol,'side':'LONG' if side=='Buy' else 'SHORT','qty':qty,'margin_required':margin_add,'risk_usdt':actual_risk,'risk_remaining_before':remaining,'pyramid_count':count+1,'order':order}
+
+
 def manage_open_positions():
     """Actively manage open Demo/Live positions.
 
@@ -1513,6 +1618,13 @@ def manage_open_positions():
             actions.append(action)
             _invalidate_demo_account_cache()
             _invalidate_demo_account_cache()
+            # A strong, already-profitable thesis may be pyramided after the
+            # protection ladder. This is deliberately capped and never averages loss.
+            if analysis.get('scale_in_recommendation') and pnl_pct >= 12.0:
+                try:
+                    actions.append(demo_add_to_position(p, risk_pct=2.0, capital_allocation_pct=20.0))
+                except Exception as add_err:
+                    actions.append({'symbol':symbol,'action':'PYRAMID_SKIPPED','reason':str(add_err)[:180]})
         except Exception as e:
             actions.append({'symbol':p.get('symbol'),'action':'MANAGEMENT_ERROR','error':str(e)})
     return {'ok':True,'mode':MODE,'actions':actions,'checked_at':int(time.time()*1000)}
@@ -1730,7 +1842,7 @@ def paper_open(d):
     if side not in ('LONG', 'SHORT'): raise ValueError('side must be LONG or SHORT')
     if not symbol.endswith('USDT'): raise ValueError('symbol must be a USDT perpetual')
     if entry <= 0 or sl <= 0 or tp <= 0: raise ValueError('prices must be positive')
-    if not 0 < risk_pct <= 50: raise ValueError('risk_pct must be between 0 and 50')
+    if not 0 < risk_pct <= MAX_RISK_PCT_PER_TRADE: raise ValueError('risk_pct must be between 0 and 10')
     if side == 'LONG' and not (sl < entry < tp): raise ValueError('LONG requires SL < entry < TP')
     if side == 'SHORT' and not (tp < entry < sl): raise ValueError('SHORT requires TP < entry < SL')
     with _lock:
@@ -1749,13 +1861,22 @@ def paper_open(d):
         budget = min(_state.get('trading_budget', _state['balance']), trading_capital)
         reserved = sum(float(x.get('margin_required', 0)) for x in _state['open'])
         free_budget = max(0.0, budget - reserved)
+        allocation_pct = min(MAX_ALLOCATION_CAPITAL_PCT, max(1.0, float(d.get('capital_allocation_pct', MAX_ALLOCATION_CAPITAL_PCT))))
+        allocation_cap = free_budget * allocation_pct / 100.0
         margin_required = entry * qty / LEVERAGE
+        if margin_required > allocation_cap:
+            qty = _round_step((allocation_cap * LEVERAGE) / entry, step) if step else (allocation_cap * LEVERAGE) / entry
+            margin_required = entry * qty / LEVERAGE
+            risk = qty * dist
         if margin_required > free_budget * MAX_MARGIN_FRACTION:
             allowed_margin = free_budget * MAX_MARGIN_FRACTION
             qty = _round_step((allowed_margin * LEVERAGE) / entry, step) if step else (allowed_margin * LEVERAGE) / entry
             margin_required = entry * qty / LEVERAGE
             risk = qty * dist
         if qty <= 0 or (min_qty > 0 and qty < min_qty): raise ValueError(f'position too small for available margin (${free_budget:.4f})')
+        existing_risk=sum(float(x.get('risk_usdt',0) or 0) for x in _state['open'])
+        if existing_risk + risk > max(0.0, trading_capital) * TOTAL_OPEN_RISK_PCT / 100.0 + 1e-9:
+            raise ValueError(f'total open risk ${existing_risk + risk:.2f} exceeds portfolio limit {TOTAL_OPEN_RISK_PCT:g}%')
         entry_exec = entry * (1 + PAPER_SLIPPAGE_RATE if side == 'LONG' else 1 - PAPER_SLIPPAGE_RATE)
         fee = entry_exec * qty * PAPER_FEE_RATE
         if fee > _state['balance'] * 0.05: raise ValueError('entry fee would be too large for current balance')

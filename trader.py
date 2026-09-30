@@ -1,5 +1,6 @@
 import os, time
 from engine import MODE, MAX_POSITIONS, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market, manage_open_positions
+from capital_allocator import allocate, validate_allocations, TOTAL_RISK_PCT, MAX_NEW_ENTRIES
 
 STRATEGY_DEFAULT = os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both'
 
@@ -84,12 +85,20 @@ def run_auto_cycle():
             key=x['symbol'];
             if key not in best or float(x.get('score',0)) > float(best[key].get('score',0)): best[key]=x
         candidates=sorted(best.values(), key=lambda x: float(x.get('score',0)), reverse=True)
+        free_slots=max(0, max_positions-len(positions))
+        try:
+            cap_view=float((state.get('bot_capital') or {}).get('bot_available_capital') or state.get('bot_available_capital') or 100.0)
+        except Exception:
+            cap_view=100.0
+        allocated=allocate(candidates, cap_view, total_risk_pct=TOTAL_RISK_PCT, max_new=min(MAX_NEW_ENTRIES, free_slots))
+        allocation_check=validate_allocations(allocated, TOTAL_RISK_PCT)
         opened=[]; rejected=[]; used=len(positions)
-        for x in candidates:
+        for x in allocated:
             if used >= max_positions: break
+            a=x.get('allocation') or {}
             try:
-                demo_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':risk_pct,'leverage':leverage,'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
-                opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100"); used += 1
+                demo_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':min(10.0,float(a.get('risk_pct_of_bot') or risk_pct)),'leverage':10.0,'capital_allocation_pct':a.get('capital_pct'),'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
+                opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100 • cap {a.get('capital_pct',0):.1f}% • risk {a.get('risk_pct_of_bot',0):.2f}%"); used += 1
             except (ValueError, RuntimeError) as e: rejected.append(f"{x.get('strategy','?').upper()} {x['symbol']}: {e}")
             except Exception as e: rejected.append(f"{x.get('strategy','?').upper()} {x['symbol']}: unexpected execution error: {e}")
         result = scans[modes[0]] if len(modes)==1 else {'ok':True,'mode':MODE,'strategy':'both','scans':scans,'results':sum([r.get('results',[]) for r in scans.values()],[])}
@@ -106,8 +115,10 @@ def run_auto_cycle():
             'rejection_count':len(rejected),
             'open_positions_before':len(positions),
             'max_positions':max_positions,
-            'risk_pct':risk_pct,
-            'leverage':leverage,
+            'risk_policy_pct':TOTAL_RISK_PCT,
+            'leverage_target':10.0,
+            'allocation':allocated,
+            'allocation_check':allocation_check,
         }
         return result, action, diagnostics
 
@@ -130,12 +141,18 @@ def run_auto_cycle():
     best={}
     for x in candidates:
         if x['symbol'] not in best or float(x.get('score',0))>float(best[x['symbol']].get('score',0)): best[x['symbol']]=x
+    candidates=sorted(best.values(),key=lambda x:float(x.get('score',0)),reverse=True)
+    free_slots=max(0, max_positions-len(state.get('open',[])))
+    cap_view=float(state.get('available_margin_budget') or state.get('trading_budget') or 100.0)
+    allocated=allocate(candidates, cap_view, total_risk_pct=TOTAL_RISK_PCT, max_new=min(MAX_NEW_ENTRIES, free_slots))
+    allocation_check=validate_allocations(allocated, TOTAL_RISK_PCT)
     opened=[]; rejected=[]; used=len(state.get('open',[]))
-    for x in sorted(best.values(),key=lambda x:float(x.get('score',0)),reverse=True):
+    for x in allocated:
         if used>=max_positions: break
+        a=x.get('allocation') or {}
         try:
-            paper_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':risk_pct,'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
-            opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100"); used+=1
+            paper_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':min(10.0,float(a.get('risk_pct_of_bot') or risk_pct)),'capital_allocation_pct':a.get('capital_pct'),'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
+            opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100 • cap {a.get('capital_pct',0):.1f}% • risk {a.get('risk_pct_of_bot',0):.2f}%"); used+=1
         except ValueError as e: rejected.append(f"{x['symbol']}: {e}")
     result=scans[modes[0]] if len(modes)==1 else {'ok':True,'mode':MODE,'strategy':'both','scans':scans,'results':sum([r.get('results',[]) for r in scans.values()],[])}
     action='AUTO PAPER: '+', '.join(opened) if opened else 'scan complete — no paper entry'
@@ -149,7 +166,10 @@ def run_auto_cycle():
         'rejection_count':len(rejected),
         'open_positions_before':len(state.get('open',[])),
         'max_positions':max_positions,
-        'risk_pct':risk_pct,
+        'risk_policy_pct':TOTAL_RISK_PCT,
+        'leverage_target':10.0,
+        'allocation':allocated,
+        'allocation_check':allocation_check,
     }
     return result,action,diagnostics
 

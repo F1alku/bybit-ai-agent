@@ -30,13 +30,18 @@ auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('
 
 def _apply_trading_settings():
     import engine
+    # Final portfolio policy is intentionally fixed: $100 bot capital, 10% total
+    # risk budget and 10x target leverage. Max positions/gates remain configurable.
     engine.MAX_POSITIONS = int(get_setting('max_positions', engine.MAX_POSITIONS))
-    engine.RISK_PCT_DEFAULT = float(get_setting('risk_pct', engine.RISK_PCT_DEFAULT))
-    engine.DEMO_RISK_PCT = engine.RISK_PCT_DEFAULT
-    engine.LIVE_RISK_PCT = engine.RISK_PCT_DEFAULT
-    engine.LEVERAGE = float(get_setting('leverage', engine.LEVERAGE))
+    engine.RISK_PCT_DEFAULT = 10.0
+    engine.DEMO_RISK_PCT = 10.0
+    engine.LIVE_RISK_PCT = 10.0
+    engine.LEVERAGE = 10.0
     engine.LEVERAGE_MODE = 'auto'
-    engine.TOTAL_OPEN_RISK_PCT = float(get_setting('total_open_risk_pct', engine.TOTAL_OPEN_RISK_PCT))
+    engine.TOTAL_OPEN_RISK_PCT = 10.0
+    set_setting('risk_pct', 10.0)
+    set_setting('leverage', 10.0)
+    set_setting('total_open_risk_pct', 10.0)
     engine.DEMO_MAX_DAILY_LOSS = float(get_setting('daily_loss_limit_usdt', engine.DEMO_MAX_DAILY_LOSS))
     engine.LIVE_MAX_DAILY_LOSS = float(get_setting('daily_loss_limit_usdt', engine.LIVE_MAX_DAILY_LOSS))
     engine.DAILY_LOSS_LIMIT_PCT = float(get_setting('paper_daily_loss_pct', engine.DAILY_LOSS_LIMIT_PCT))
@@ -46,14 +51,25 @@ _apply_trading_settings()
 _history_sync_task = None
 _history_sync_state = {"last_run": None, "last_ok": None, "synced": 0, "exchange_closed_count": 0, "errors": [], "learning_errors": [], "learning_sync": {}}
 
+def _history_sync_once():
+    """Run exchange reconciliation entirely outside the asyncio event loop."""
+    import engine as _engine
+    items = _engine._demo_closed_pnl(500)
+    result = sync_closed_pnl_detailed(MODE, items)
+    learning_result = record_lessons_from_closed(1000)
+    return result, learning_result
+
+
 async def _history_sync_loop():
-    """Continuously reconcile Bybit Closed PnL into the durable journal.
-    This runs inside the Render web process; worker.py is not required.
+    """Continuously reconcile Bybit Closed PnL without blocking HTTP/health checks.
+
+    All synchronous Bybit + DB work is moved to a worker thread. A slow/private
+    Bybit request must never freeze FastAPI/Render and turn /api/journal into 502.
     """
     while True:
         try:
             if MODE in ("demo", "live"):
-                result = sync_closed_pnl_detailed(MODE, __import__("engine")._demo_closed_pnl(500))
+                result, learning_result = await asyncio.to_thread(_history_sync_once)
                 # Record the exchange->DB result before learning. Learning must never
                 # make a successful history sync look like a failed database sync.
                 _history_sync_state.update({
@@ -63,12 +79,8 @@ async def _history_sync_loop():
                     "errors": list(result.get("errors", [])),
                     "learning_errors": [],
                 })
-                try:
-                    learning_result = record_lessons_from_closed(1000)
-                    _history_sync_state["learning_sync"] = {k: learning_result.get(k, 0) for k in ('created_or_updated','lesson_total','closed_rows','matched_context','unmatched_context','match_methods','failed_rows','pending','errors')}
-                    _history_sync_state["learning_errors"] = list(learning_result.get('errors', []))[:5]
-                except Exception as le:
-                    _history_sync_state["learning_errors"] = [str(le)[:300]]
+                _history_sync_state["learning_sync"] = {k: learning_result.get(k, 0) for k in ('created_or_updated','lesson_total','closed_rows','matched_context','unmatched_context','match_methods','failed_rows','pending','errors')}
+                _history_sync_state["learning_errors"] = list(learning_result.get('errors', []))[:5]
         except Exception as e:
             _history_sync_state.update({"last_run": time.time(), "last_ok": False, "errors": [str(e)]})
         await asyncio.sleep(30)
@@ -81,18 +93,9 @@ async def lifespan(_app):
     db = db_status()
     print(f"[DB] backend={db['backend']} configured={db['configured']} durable={db['durable']} ok={db['ok']}" + (f" error={db['error']}" if db.get('error') else ''))
     _apply_trading_settings()
-    if MODE in ('demo','live'):
-        try:
-            result = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(500))
-            _history_sync_state.update({"last_run": time.time(), "last_ok": not bool(result.get("errors")), "synced": int(result.get("synced", 0)), "exchange_closed_count": int(result.get("exchange_closed_count", 0)), "errors": list(result.get("errors", [])), "learning_errors": []})
-            try:
-                learning_result = record_lessons_from_closed(1000)
-                _history_sync_state["learning_sync"] = {k: learning_result.get(k, 0) for k in ('created_or_updated','lesson_total','closed_rows','matched_context','unmatched_context','match_methods','failed_rows','pending','errors')}
-                _history_sync_state["learning_errors"] = list(learning_result.get('errors', []))[:5]
-            except Exception as le:
-                _history_sync_state["learning_errors"] = [str(le)[:300]]
-        except Exception as e:
-            _history_sync_state.update({"last_run": time.time(), "last_ok": False, "errors": [str(e)]})
+    # Never perform synchronous Bybit requests during application startup.
+    # Start the reconciliation loop first so Render can answer health checks and
+    # /api/journal immediately even when Bybit is slow/unavailable.
     _history_sync_task = asyncio.create_task(_history_sync_loop())
     # v6.1: first deployment can opt Demo AUTO into the persistent setting once.
     # After the migration the user's manual ON/OFF choice remains authoritative.
@@ -118,7 +121,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.27', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.2.0', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -204,7 +207,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.27', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.2.0', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -301,20 +304,20 @@ def update_trading_config(req: TradingConfigRequest):
     import engine
     with auto_lock:
         engine.MAX_POSITIONS = int(req.max_positions)
-        engine.RISK_PCT_DEFAULT = float(req.risk_pct)
-        engine.DEMO_RISK_PCT = float(req.risk_pct)
-        engine.LIVE_RISK_PCT = float(req.risk_pct)
-        engine.LEVERAGE = float(req.leverage)
+        engine.RISK_PCT_DEFAULT = 10.0
+        engine.DEMO_RISK_PCT = 10.0
+        engine.LIVE_RISK_PCT = 10.0
+        engine.LEVERAGE = 10.0
         engine.LEVERAGE_MODE = 'auto'
-        engine.TOTAL_OPEN_RISK_PCT = float(req.total_open_risk_pct)
+        engine.TOTAL_OPEN_RISK_PCT = 10.0
         AUTO_INTERVAL_SEC = int(req.auto_interval_sec)
         engine.DEMO_MAX_DAILY_LOSS = float(req.daily_loss_limit_usdt)
         engine.LIVE_MAX_DAILY_LOSS = float(req.daily_loss_limit_usdt)
         engine.DAILY_LOSS_LIMIT_PCT = float(req.paper_daily_loss_pct)
         set_setting('max_positions', engine.MAX_POSITIONS)
-        set_setting('risk_pct', engine.RISK_PCT_DEFAULT)
-        set_setting('leverage', engine.LEVERAGE)
-        set_setting('total_open_risk_pct', engine.TOTAL_OPEN_RISK_PCT)
+        set_setting('risk_pct', 10.0)
+        set_setting('leverage', 10.0)
+        set_setting('total_open_risk_pct', 10.0)
         set_setting('auto_interval_sec', AUTO_INTERVAL_SEC)
         set_setting('daily_loss_limit_usdt', engine.DEMO_MAX_DAILY_LOSS)
         set_setting('paper_daily_loss_pct', engine.DAILY_LOSS_LIMIT_PCT)
