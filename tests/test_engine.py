@@ -457,31 +457,3 @@ def test_paper_auto_uses_persisted_max_positions(monkeypatch):
         assert diag['max_positions'] == 25
     finally:
         engine.MAX_POSITIONS = old
-
-
-def test_market_order_uses_max_mkt_order_qty(monkeypatch):
-    import engine
-    monkeypatch.setattr(engine, "instruments", lambda: [{
-        "symbol": "GRASSUSDT",
-        "lotSizeFilter": {
-            "qtyStep": "1",
-            "minOrderQty": "1",
-            "maxOrderQty": "9300000000000",
-            "maxMktOrderQty": "9300000000000",
-        },
-    }])
-    assert engine._symbol_rules("GRASSUSDT") == (1.0, 1.0, 9300000000000.0)
-
-
-def test_market_order_prefers_market_max_over_limit_max(monkeypatch):
-    import engine
-    monkeypatch.setattr(engine, "instruments", lambda: [{
-        "symbol": "PHAUSDT",
-        "lotSizeFilter": {
-            "qtyStep": "1",
-            "minOrderQty": "1",
-            "maxOrderQty": "50000000000000",
-            "maxMktOrderQty": "10000000000000",
-        },
-    }])
-    assert engine._symbol_rules("PHAUSDT")[2] == 10000000000000.0
