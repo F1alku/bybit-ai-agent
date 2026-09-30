@@ -37,3 +37,10 @@ def test_closed_trade_creates_persistent_lesson(tmp_path, monkeypatch):
     assert result['created_or_updated']==1
     assert lessons[0]['outcome']=='WIN'
     assert abs(lessons[0]['r_multiple']-3.96)<1e-9
+
+
+def test_learning_module_has_closed_trade_fallback():
+    src=open("learning_engine.py", encoding="utf-8").read()
+    assert "execId/orderId" in src
+    assert "Контекст входа не найден" in src
+    assert "meta_by_symbol_side" in src
