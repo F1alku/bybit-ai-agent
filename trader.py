@@ -1,6 +1,6 @@
 import os, time
 from engine import MODE, MAX_POSITIONS, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market, manage_open_positions
-from capital_allocator import allocate, validate_allocations, TOTAL_RISK_PCT, MAX_NEW_ENTRIES
+from capital_allocator import allocate, validate_allocations, RISK_PER_TRADE_PCT, MAX_NEW_ENTRIES
 
 STRATEGY_DEFAULT = os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both'
 
@@ -90,8 +90,8 @@ def run_auto_cycle():
             cap_view=float((state.get('bot_capital') or {}).get('bot_available_capital') or state.get('bot_available_capital') or 100.0)
         except Exception:
             cap_view=100.0
-        allocated=allocate(candidates, cap_view, total_risk_pct=TOTAL_RISK_PCT, max_new=min(MAX_NEW_ENTRIES, free_slots))
-        allocation_check=validate_allocations(allocated, TOTAL_RISK_PCT)
+        allocated=allocate(candidates, cap_view, risk_per_trade_pct=RISK_PER_TRADE_PCT, max_new=min(MAX_NEW_ENTRIES, free_slots))
+        allocation_check=validate_allocations(allocated, RISK_PER_TRADE_PCT)
         opened=[]; rejected=[]; used=len(positions)
         for x in allocated:
             if used >= max_positions: break
@@ -115,7 +115,7 @@ def run_auto_cycle():
             'rejection_count':len(rejected),
             'open_positions_before':len(positions),
             'max_positions':max_positions,
-            'risk_policy_pct':TOTAL_RISK_PCT,
+            'risk_policy_pct':RISK_PER_TRADE_PCT, 'risk_scope':'per_trade',
             'leverage_target':10.0,
             'allocation':allocated,
             'allocation_check':allocation_check,
@@ -144,8 +144,8 @@ def run_auto_cycle():
     candidates=sorted(best.values(),key=lambda x:float(x.get('score',0)),reverse=True)
     free_slots=max(0, max_positions-len(state.get('open',[])))
     cap_view=float(state.get('available_margin_budget') or state.get('trading_budget') or 100.0)
-    allocated=allocate(candidates, cap_view, total_risk_pct=TOTAL_RISK_PCT, max_new=min(MAX_NEW_ENTRIES, free_slots))
-    allocation_check=validate_allocations(allocated, TOTAL_RISK_PCT)
+    allocated=allocate(candidates, cap_view, risk_per_trade_pct=RISK_PER_TRADE_PCT, max_new=min(MAX_NEW_ENTRIES, free_slots))
+    allocation_check=validate_allocations(allocated, RISK_PER_TRADE_PCT)
     opened=[]; rejected=[]; used=len(state.get('open',[]))
     for x in allocated:
         if used>=max_positions: break
@@ -166,7 +166,7 @@ def run_auto_cycle():
         'rejection_count':len(rejected),
         'open_positions_before':len(state.get('open',[])),
         'max_positions':max_positions,
-        'risk_policy_pct':TOTAL_RISK_PCT,
+        'risk_policy_pct':RISK_PER_TRADE_PCT, 'risk_scope':'per_trade',
         'leverage_target':10.0,
         'allocation':allocated,
         'allocation_check':allocation_check,

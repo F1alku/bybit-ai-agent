@@ -30,18 +30,18 @@ auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('
 
 def _apply_trading_settings():
     import engine
-    # Final portfolio policy is intentionally fixed: $100 bot capital, 10% total
-    # risk budget and 10x target leverage. Max positions/gates remain configurable.
+    # Final portfolio policy: $100 bot capital, 10% risk PER trade, 10x target leverage.
+    # Aggregate stop-risk is intentionally not pooled across positions.
     engine.MAX_POSITIONS = int(get_setting('max_positions', engine.MAX_POSITIONS))
     engine.RISK_PCT_DEFAULT = 10.0
     engine.DEMO_RISK_PCT = 10.0
     engine.LIVE_RISK_PCT = 10.0
     engine.LEVERAGE = 10.0
     engine.LEVERAGE_MODE = 'auto'
-    engine.TOTAL_OPEN_RISK_PCT = 10.0
+    engine.TOTAL_OPEN_RISK_PCT = 0.0  # legacy field disabled; risk is per trade
     set_setting('risk_pct', 10.0)
     set_setting('leverage', 10.0)
-    set_setting('total_open_risk_pct', 10.0)
+    set_setting('total_open_risk_pct', 0.0)
     engine.DEMO_MAX_DAILY_LOSS = float(get_setting('daily_loss_limit_usdt', engine.DEMO_MAX_DAILY_LOSS))
     engine.LIVE_MAX_DAILY_LOSS = float(get_setting('daily_loss_limit_usdt', engine.LIVE_MAX_DAILY_LOSS))
     engine.DAILY_LOSS_LIMIT_PCT = float(get_setting('paper_daily_loss_pct', engine.DAILY_LOSS_LIMIT_PCT))
@@ -52,11 +52,19 @@ _history_sync_task = None
 _history_sync_state = {"last_run": None, "last_ok": None, "synced": 0, "exchange_closed_count": 0, "errors": [], "learning_errors": [], "learning_sync": {}}
 
 def _history_sync_once():
-    """Run exchange reconciliation entirely outside the asyncio event loop."""
+    """Sync durable history first; learning is a separate stage."""
     import engine as _engine
     items = _engine._demo_closed_pnl(500)
     result = sync_closed_pnl_detailed(MODE, items)
-    learning_result = record_lessons_from_closed(1000)
+    try:
+        init_learning_db()
+        learning_result = record_lessons_from_closed(1000)
+    except Exception as e:
+        learning_result = {
+            'created_or_updated': 0, 'lesson_total': 0, 'closed_rows': 0,
+            'matched_context': 0, 'unmatched_context': 0, 'match_methods': {},
+            'failed_rows': 0, 'pending': 0, 'errors': [str(e)]
+        }
     return result, learning_result
 
 
@@ -121,7 +129,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.2.0', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.2.1', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -207,7 +215,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.2.0', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.2.1', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -288,7 +296,7 @@ class TradingConfigRequest(BaseModel):
     max_positions: int = Field(..., ge=1, le=100)
     risk_pct: float = Field(..., gt=0, le=50)
     leverage: float = Field(..., ge=1, le=100)
-    total_open_risk_pct: float = Field(..., gt=0, le=50)
+    total_open_risk_pct: float = Field(..., ge=0, le=50)
     auto_interval_sec: int = Field(..., ge=30, le=600)
     daily_loss_limit_usdt: float = Field(..., gt=0, le=1000000)
     paper_daily_loss_pct: float = Field(..., gt=0, le=100)
@@ -296,7 +304,7 @@ class TradingConfigRequest(BaseModel):
 @app.get('/api/trading-config')
 def trading_config():
     import engine
-    return {'ok': True, 'max_positions': engine.MAX_POSITIONS, 'default_leverage': engine.LEVERAGE, 'leverage_mode': engine.LEVERAGE_MODE, 'risk_pct': engine.RISK_PCT_DEFAULT, 'total_open_risk_pct': engine.TOTAL_OPEN_RISK_PCT, 'auto_interval_sec': AUTO_INTERVAL_SEC, 'daily_loss_limit_usdt': engine.DEMO_MAX_DAILY_LOSS, 'paper_daily_loss_pct': engine.DAILY_LOSS_LIMIT_PCT, 'full_market': engine.FULL_MARKET_DEFAULT}
+    return {'ok': True, 'max_positions': engine.MAX_POSITIONS, 'default_leverage': engine.LEVERAGE, 'leverage_mode': engine.LEVERAGE_MODE, 'risk_pct': engine.RISK_PCT_DEFAULT, 'risk_per_trade_pct': engine.RISK_PCT_DEFAULT, 'total_open_risk_pct': engine.TOTAL_OPEN_RISK_PCT, 'risk_scope': 'per_trade', 'auto_interval_sec': AUTO_INTERVAL_SEC, 'daily_loss_limit_usdt': engine.DEMO_MAX_DAILY_LOSS, 'paper_daily_loss_pct': engine.DAILY_LOSS_LIMIT_PCT, 'full_market': engine.FULL_MARKET_DEFAULT}
 
 @app.post('/api/trading-config')
 def update_trading_config(req: TradingConfigRequest):
@@ -309,7 +317,7 @@ def update_trading_config(req: TradingConfigRequest):
         engine.LIVE_RISK_PCT = 10.0
         engine.LEVERAGE = 10.0
         engine.LEVERAGE_MODE = 'auto'
-        engine.TOTAL_OPEN_RISK_PCT = 10.0
+        engine.TOTAL_OPEN_RISK_PCT = 0.0  # legacy field disabled; risk is per trade
         AUTO_INTERVAL_SEC = int(req.auto_interval_sec)
         engine.DEMO_MAX_DAILY_LOSS = float(req.daily_loss_limit_usdt)
         engine.LIVE_MAX_DAILY_LOSS = float(req.daily_loss_limit_usdt)
@@ -317,7 +325,7 @@ def update_trading_config(req: TradingConfigRequest):
         set_setting('max_positions', engine.MAX_POSITIONS)
         set_setting('risk_pct', 10.0)
         set_setting('leverage', 10.0)
-        set_setting('total_open_risk_pct', 10.0)
+        set_setting('total_open_risk_pct', 0.0)
         set_setting('auto_interval_sec', AUTO_INTERVAL_SEC)
         set_setting('daily_loss_limit_usdt', engine.DEMO_MAX_DAILY_LOSS)
         set_setting('paper_daily_loss_pct', engine.DAILY_LOSS_LIMIT_PCT)
@@ -486,14 +494,20 @@ def journal():
         # serves durable PostgreSQL/SQLite state immediately.
         db = db_status()
         trades = journal_recent(50)
-        counts = learning_counts()
+        learning_error = None
+        try:
+            counts = learning_counts()
+            lessons = recent_lessons(50)
+        except Exception as e:
+            counts = {'closed_rows': len(trades), 'lesson_total': 0, 'pending': len(trades)}
+            lessons = []
+            learning_error = str(e)
         learning_sync = dict(_history_sync_state.get('learning_sync') or {})
         learning_sync.update({
             'closed_rows': int(counts.get('closed_rows', 0)),
             'lesson_total': int(counts.get('lesson_total', 0)),
             'pending': int(counts.get('pending', 0)),
         })
-        lessons = recent_lessons(50)
         return {
             'ok': True, 'mode': MODE, 'durable_journal': bool(db.get('durable')),
             'db_backend': db.get('backend'), 'db_error': db.get('error'),
@@ -502,7 +516,8 @@ def journal():
             'synced_count': _history_sync_state.get('synced', 0),
             'sync_errors': _history_sync_state.get('errors', []),
             'db_trade_count': len(trades), 'trades': trades,
-            'learning_sync': learning_sync, 'lessons': lessons
+            'learning_sync': learning_sync, 'lessons': lessons,
+            'learning_error': learning_error
         }
     except Exception as e:
         return {'ok': False, 'mode': MODE, 'trades': [], 'lessons': [], 'error': str(e)}

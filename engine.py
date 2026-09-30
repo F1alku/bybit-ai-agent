@@ -32,11 +32,11 @@ RETRY_COUNT = 2
 PRIVATE_RETRY_COUNT = 2
 DEMO_ACCOUNT_CACHE_TTL = 8.0
 DEMO_CLOSED_PNL_CACHE_TTL = 5.0
-MAX_POSITIONS = int(os.getenv('MAX_POSITIONS', '8'))
+MAX_POSITIONS = int(os.getenv('MAX_POSITIONS', '10'))
 RISK_PCT_DEFAULT = float(os.getenv('RISK_PCT_DEFAULT', '10'))
 LEVERAGE = float(os.getenv('DEFAULT_LEVERAGE', '10'))
 LEVERAGE_MODE = os.getenv('LEVERAGE_MODE', 'fixed').lower()
-TOTAL_OPEN_RISK_PCT = float(os.getenv('TOTAL_OPEN_RISK_PCT', '10'))
+TOTAL_OPEN_RISK_PCT = 0.0  # legacy compatibility; risk is enforced per trade
 START_BALANCE = 10.0
 DEMO_TRADING_BUDGET = float(os.getenv('DEMO_TRADING_BUDGET', '100'))
 DEMO_MAX_DAILY_LOSS = float(os.getenv('DEMO_MAX_DAILY_LOSS', '20'))
@@ -1051,7 +1051,7 @@ def _bot_capital_view(unrealized_pnl=0.0, reserved_margin=0.0):
     from journal import get_setting
     state = _sync_bot_capital()
     trading = float(state['trading_capital'])
-    # Unrealized gains do not increase risk budget; unrealized losses do reduce it.
+    # Unrealized gains do not increase per-trade risk; unrealized losses can reduce available trading capital.
     risk_equity = max(0.0, trading + min(0.0, float(unrealized_pnl)))
     available = max(0.0, risk_equity - float(reserved_margin))
     available_limit = float(state.get('available_capital_limit', 0.0))
@@ -1192,22 +1192,6 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
         raise ValueError(f'position risk ${actual_risk:.2f} exceeds allowed ${risk_cash:.2f}')
     if qty <= 0 or (min_qty > 0 and qty < min_qty):
         raise ValueError(f'position too small for available bot capital (${budget:.2f})')
-    total_open_risk = 0.0
-    for x in positions:
-        q = abs(float(x.get('size') or 0))
-        ep = float(x.get('avgPrice') or 0)
-        slx = float(x.get('stopLoss') or 0)
-        if q <= 0 or ep <= 0:
-            continue
-        # Prefer the exchange-confirmed SL. If unavailable, do not pretend the risk is
-        # smaller than it is: use the configured per-trade risk against position notional.
-        if slx > 0:
-            total_open_risk += q * abs(ep - slx)
-        else:
-            total_open_risk += q * ep * (risk_pct / 100)
-    total_limit = min(equity, budget) * TOTAL_OPEN_RISK_PCT / 100
-    if total_open_risk + actual_risk > total_limit + 1e-9:
-        raise ValueError(f'total open risk ${total_open_risk + actual_risk:.2f} exceeds portfolio limit ${total_limit:.2f}')
     details = (qty, margin, available, equity, cap, leverage, constraints, actual_risk)
     return details if return_details else details[:5]
 
@@ -1421,6 +1405,22 @@ def _profit_ladder_key(p, stage):
 def _profit_ladder_initial_qty_key(p):
     return f"profit_ladder_initial:{p.get('symbol')}:{p.get('side')}:{p.get('avgPrice')}"
 
+def _profit_peak_key(p):
+    return f"profit_peak:{p.get('symbol')}:{p.get('side')}:{p.get('avgPrice')}"
+
+
+def _profit_peak_lock_pct(peak_pct):
+    """Dynamic profit protection after the fixed +10..+50 ladder.
+
+    Once a trade has reached +50% on occupied margin, protect a trailing slice
+    of the peak rather than allowing a +70% winner to fall all the way back to
+    breakeven. The lock trails the peak by 15 percentage points, with a floor
+    at +40%.
+    """
+    if peak_pct < 50.0:
+        return None
+    return max(40.0, peak_pct - 15.0)
+
 def _profit_ladder_crossed(pnl_pct):
     return [stage for stage, fraction, lock_pct in PROFIT_LADDER if pnl_pct >= stage]
 
@@ -1441,7 +1441,7 @@ def demo_add_to_position(p, risk_pct=2.0, capital_allocation_pct=20.0):
 
     This is pyramiding, not averaging: the position must already be profitable,
     the hard SL must protect the existing thesis, and the new risk must fit the
-    remaining 10% portfolio risk budget. At most two adds are permitted per
+    a separate 10% per-add risk budget. At most two adds are permitted per
     original position.
     """
     if MODE not in ('demo','live'):
@@ -1462,14 +1462,8 @@ def demo_add_to_position(p, risk_pct=2.0, capital_allocation_pct=20.0):
     available,equity,_=_demo_available_usdt()
     cap=_bot_capital_view(unrealized_pnl=sum(float(x.get('unrealisedPnl') or 0) for x in positions), reserved_margin=sum(abs(float(x.get('positionIM') or 0)) for x in positions))
     budget=min(cap['bot_available_capital'],available)
-    existing_risk=0.0
-    for x in positions:
-        q=abs(float(x.get('size') or 0)); ep=float(x.get('avgPrice') or 0); sx=float(x.get('stopLoss') or 0)
-        if q>0 and ep>0 and sx>0: existing_risk += q*abs(ep-sx)
-    total_limit=min(equity,budget)*TOTAL_OPEN_RISK_PCT/100
-    remaining=max(0.0,total_limit-existing_risk)
-    requested_risk=min(budget*min(MAX_RISK_PCT_PER_TRADE,max(0.25,float(risk_pct)))/100.0, remaining*0.5)
-    if requested_risk<=0: raise ValueError('no portfolio risk budget remains for pyramiding')
+    requested_risk=min(budget*min(MAX_RISK_PCT_PER_TRADE,max(0.25,float(risk_pct)))/100.0, budget*MAX_RISK_PCT_PER_TRADE/100.0)
+    if requested_risk<=0: raise ValueError('no per-trade risk budget remains for pyramiding')
     dist=abs(mark-sl)
     qty_step,min_qty,max_qty=_symbol_rules(symbol)
     qty=requested_risk/dist
@@ -1482,7 +1476,7 @@ def demo_add_to_position(p, risk_pct=2.0, capital_allocation_pct=20.0):
         qty=_round_step(allocation_cap*leverage/mark,qty_step) if qty_step else allocation_cap*leverage/mark
         margin_add=mark*qty/leverage
     actual_risk=qty*dist
-    if actual_risk<=0 or actual_risk>remaining+1e-9: raise ValueError('pyramiding risk exceeds remaining portfolio budget')
+    if actual_risk<=0 or actual_risk>budget*MAX_RISK_PCT_PER_TRADE/100.0+1e-9: raise ValueError('pyramiding risk exceeds per-trade 10% budget')
     if qty<=0 or (min_qty>0 and qty<min_qty): raise ValueError('pyramiding size is below exchange minimum')
     bybit_private_post('/v5/position/set-leverage',{'category':'linear','symbol':symbol,'buyLeverage':str(leverage),'sellLeverage':str(leverage)},allow_ret_codes={110043})
     order=bybit_private_post('/v5/order/create',{
@@ -1559,11 +1553,54 @@ def manage_open_positions():
                 initial_qty=size
                 set_setting(initial_key, str(initial_qty))
 
+            peak_key=_profit_peak_key(p)
+            try:
+                peak_pct=max(float(get_setting(peak_key, '0') or 0), pnl_pct)
+            except Exception:
+                peak_pct=pnl_pct
+            set_setting(peak_key, str(peak_pct))
+
+            # After +50%, protect the runner dynamically from the highest achieved
+            # P&L. A +70% winner therefore gets a +55% protection level instead of
+            # being allowed to round-trip back to zero. AI thesis exit may close
+            # earlier when the market invalidates the trade.
+            dynamic_lock=_profit_peak_lock_pct(peak_pct)
+            current_sl=float(p.get('stopLoss') or 0)
+            if dynamic_lock is not None and peak_pct - pnl_pct >= 15.0:
+                target_sl=_profit_lock_price(entry, size, margin, side, dynamic_lock)
+                close_side='Sell' if side=='Buy' else 'Buy'
+                order=bybit_private_post('/v5/order/create', {
+                    'category':'linear','symbol':symbol,'side':close_side,'orderType':'Market','qty':str(size),
+                    'positionIdx':int(p.get('positionIdx') or 0),'reduceOnly':True,'closeOnTrigger':True,
+                    'orderLinkId':f'ai-profit-protect-{int(time.time()*1000)}'
+                })
+                actions.append({'symbol':symbol,'action':'PROFIT_PROTECTION_EXIT','closed_qty':size,
+                    'pnl_on_margin_pct':round(pnl_pct,3),'peak_pnl_on_margin_pct':round(peak_pct,3),
+                    'protected_profit_pct':round(dynamic_lock,3),'sl_reference_price':target_sl,
+                    'reason':f'profit retraced {peak_pct-pnl_pct:.1f}pp from peak', 'order':order, 'analysis':analysis})
+                _invalidate_demo_account_cache()
+                continue
+
             crossed=[]
             for stage, fraction, lock_pct in PROFIT_LADDER:
                 if pnl_pct >= stage and get_setting(_profit_ladder_key(p, stage), '0') != '1':
                     crossed.append((stage, fraction, lock_pct))
             if not crossed:
+                if dynamic_lock is not None:
+                    target_sl=_profit_lock_price(entry, size, margin, side, dynamic_lock)
+                    current_sl=float(p.get('stopLoss') or 0)
+                    improve=(side=='Buy' and (current_sl<=0 or target_sl>current_sl)) or (side=='Sell' and (current_sl<=0 or target_sl<current_sl))
+                    if improve and target_sl>0:
+                        try:
+                            bybit_private_post('/v5/position/trading-stop',{
+                                'category':'linear','symbol':symbol,'positionIdx':int(p.get('positionIdx') or 0),
+                                'stopLoss':str(target_sl),'slTriggerBy':'MarkPrice'
+                            })
+                            actions.append({'symbol':symbol,'action':'PROFIT_PROTECTION_UPDATE',
+                                'pnl_on_margin_pct':round(pnl_pct,3),'peak_pnl_on_margin_pct':round(peak_pct,3),
+                                'protected_profit_pct':round(dynamic_lock,3),'sl_price':target_sl})
+                        except Exception as sl_err:
+                            actions.append({'symbol':symbol,'action':'PROFIT_PROTECTION_UPDATE_FAILED','error':str(sl_err)[:180]})
                 continue
 
             qty_step,min_qty,max_qty=_symbol_rules(symbol)
@@ -1589,6 +1626,8 @@ def manage_open_positions():
             # stage. At +10% we lock breakeven; at +20% we lock approximately +10%,
             # etc. Never worsen an existing SL.
             highest_lock=max(x[2] for x in crossed)
+            if dynamic_lock is not None:
+                highest_lock=max(highest_lock, dynamic_lock)
             target_sl=_profit_lock_price(entry, size, margin, side, highest_lock)
             current_sl=float(p.get('stopLoss') or 0)
             improve=(side=='Buy' and (current_sl<=0 or target_sl>current_sl)) or (side=='Sell' and (current_sl<=0 or target_sl<current_sl))
@@ -1874,9 +1913,6 @@ def paper_open(d):
             margin_required = entry * qty / LEVERAGE
             risk = qty * dist
         if qty <= 0 or (min_qty > 0 and qty < min_qty): raise ValueError(f'position too small for available margin (${free_budget:.4f})')
-        existing_risk=sum(float(x.get('risk_usdt',0) or 0) for x in _state['open'])
-        if existing_risk + risk > max(0.0, trading_capital) * TOTAL_OPEN_RISK_PCT / 100.0 + 1e-9:
-            raise ValueError(f'total open risk ${existing_risk + risk:.2f} exceeds portfolio limit {TOTAL_OPEN_RISK_PCT:g}%')
         entry_exec = entry * (1 + PAPER_SLIPPAGE_RATE if side == 'LONG' else 1 - PAPER_SLIPPAGE_RATE)
         fee = entry_exec * qty * PAPER_FEE_RATE
         if fee > _state['balance'] * 0.05: raise ValueError('entry fee would be too large for current balance')

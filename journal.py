@@ -114,6 +114,40 @@ def init_db():
         )''')
 
 
+def table_columns(table):
+    """Return existing column names without mutating the database."""
+    with _lock, _conn() as c:
+        cur=c.cursor()
+        if _is_pg():
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=%s", (table,))
+            return {str(r[0]) for r in cur.fetchall()}
+        cur.execute(f'PRAGMA table_info({table})')
+        return {str(r[1]) for r in cur.fetchall()}
+
+
+def ensure_column(table, column, typ):
+    """Idempotently add a missing column without poisoning a PostgreSQL transaction."""
+    cols=table_columns(table)
+    if column in cols:
+        return False
+    if _is_pg():
+        with _lock, _conn() as c:
+            cur=c.cursor()
+            sp=f'mig_{table}_{column}'.replace('-','_')
+            cur.execute(f'SAVEPOINT {sp}')
+            try:
+                cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {typ}')
+                cur.execute(f'RELEASE SAVEPOINT {sp}')
+                return True
+            except Exception:
+                cur.execute(f'ROLLBACK TO SAVEPOINT {sp}')
+                cur.execute(f'RELEASE SAVEPOINT {sp}')
+                return False
+    with _lock, _conn() as c:
+        c.execute(f'ALTER TABLE {table} ADD COLUMN {column} {typ}')
+        return True
+
+
 def upsert_closed_pnl(mode, item):
     import json
     ext = str(item.get('execId') or item.get('orderId') or item.get('orderLinkId') or f"{item.get('symbol')}:{item.get('updatedTime')}:{item.get('closedPnl')}")

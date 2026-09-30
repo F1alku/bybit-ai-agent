@@ -20,13 +20,13 @@ services:
       - key: DEMO_TRADING_BUDGET
         value: '100'
       - key: MAX_POSITIONS
-        value: '8'
+        value: '10'
       - key: DEFAULT_LEVERAGE
         value: '10'
       - key: LEVERAGE_MODE
         value: auto
       - key: TOTAL_OPEN_RISK_PCT
-        value: '10'
+        value: 0
       - key: FULL_MARKET_DEFAULT
         value: 'true'
       - key: FULL_MARKET_WORKERS
@@ -81,13 +81,13 @@ services:
       - key: BOT_CAPITAL_MAX
         value: '1000000'
       - key: MAX_POSITIONS
-        value: '8'
+        value: '10'
       - key: DEFAULT_LEVERAGE
         value: '10'
       - key: LEVERAGE_MODE
         value: auto
       - key: TOTAL_OPEN_RISK_PCT
-        value: '10'
+        value: 0
       - key: STRATEGY_MODE
         value: both
       - key: DATABASE_URL

@@ -10,32 +10,23 @@ from journal import _conn, _lock, init_db, recent, aliases_for_orders
 
 
 def init_learning_db():
+    """Create/migrate learning tables safely on every deployment.
+
+    PostgreSQL aborts a transaction after a duplicate ALTER unless the statement
+    is isolated by a savepoint. The previous implementation could therefore roll
+    back the preceding CREATE TABLE and leave learning_trade_meta missing.
+    """
     init_db()
     with _lock, _conn() as c:
         cur = c.cursor()
         cur.execute('''CREATE TABLE IF NOT EXISTS learning_trade_meta (
-            external_id TEXT PRIMARY KEY,
-            mode TEXT,
-            symbol TEXT,
-            side TEXT,
-            strategy TEXT,
-            score REAL,
-            risk_pct REAL,
-            leverage REAL,
-            atr_pct REAL,
-            market_regime TEXT,
-            entry_timing TEXT,
-            news_impact TEXT,
-            planned_risk REAL,
-            stop_loss REAL,
-            take_profit REAL,
-            entry_price REAL,
-            captured_at REAL
+            external_id TEXT PRIMARY KEY, mode TEXT, symbol TEXT, side TEXT, strategy TEXT,
+            score REAL, risk_pct REAL, leverage REAL, atr_pct REAL, market_regime TEXT,
+            entry_timing TEXT, news_impact TEXT, planned_risk REAL, stop_loss REAL,
+            take_profit REAL, entry_price REAL, captured_at REAL
         )''')
         cur.execute('''CREATE TABLE IF NOT EXISTS learning_insights (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at REAL NOT NULL
+            key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL
         )''')
         cur.execute('''CREATE TABLE IF NOT EXISTS trade_thesis (
             position_key TEXT PRIMARY KEY, symbol TEXT, side TEXT, entry_price REAL,
@@ -43,17 +34,18 @@ def init_learning_db():
             latest_positive TEXT, latest_negative TEXT, updated_at REAL
         )''')
         cur.execute('''CREATE TABLE IF NOT EXISTS learning_lessons (
-            external_id TEXT PRIMARY KEY,
-            mode TEXT, symbol TEXT, side TEXT, strategy TEXT, outcome TEXT,
-            net_pnl REAL, r_multiple REAL, score REAL, planned_risk REAL,
-            lesson TEXT NOT NULL, what_went_right TEXT, what_went_wrong TEXT,
-            created_at REAL NOT NULL
+            external_id TEXT PRIMARY KEY, mode TEXT, symbol TEXT, side TEXT, strategy TEXT, outcome TEXT,
+            net_pnl REAL, r_multiple REAL, score REAL, planned_risk REAL, lesson TEXT NOT NULL,
+            what_went_right TEXT, what_went_wrong TEXT, created_at REAL NOT NULL
         )''')
-        for col, typ in [('stop_loss','REAL'),('take_profit','REAL'),('entry_price','REAL')]:
-            try:
-                cur.execute(f'ALTER TABLE learning_trade_meta ADD COLUMN {col} {typ}')
-            except Exception:
-                pass
+    # Legacy-column migrations are separate from CREATE, and PostgreSQL ALTERs use
+    # savepoints. A migration conflict can no longer roll back the whole schema.
+    for col, typ in [('stop_loss','REAL'),('take_profit','REAL'),('entry_price','REAL')]:
+        try:
+            from journal import ensure_column
+            ensure_column('learning_trade_meta', col, typ)
+        except Exception:
+            pass
 
 
 def record_trade_meta(meta):
