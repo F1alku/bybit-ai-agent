@@ -193,11 +193,12 @@ def recent(limit=100):
     init_db()
     with _lock, _conn() as c:
         cur = c.cursor()
+        cols = ['external_id','mode','symbol','side','qty','entry_price','exit_price','pnl','fee','created_ms','updated_ms','reason']
         if _is_pg():
             cur.execute('SELECT external_id,mode,symbol,side,qty,entry_price,exit_price,pnl,fee,created_ms,updated_ms,reason FROM trade_journal ORDER BY COALESCE(updated_ms,0) DESC LIMIT %s', (int(limit),))
         else:
             cur.execute('SELECT external_id,mode,symbol,side,qty,entry_price,exit_price,pnl,fee,created_ms,updated_ms,reason FROM trade_journal ORDER BY COALESCE(updated_ms,0) DESC LIMIT ?', (int(limit),))
-        return [dict(r) for r in cur.fetchall()]
+        return [dict(zip(cols, r)) if not isinstance(r, dict) else r for r in cur.fetchall()]
 
 
 def realized_total(mode=None):

@@ -44,7 +44,7 @@ def _apply_trading_settings():
 _apply_trading_settings()
 
 _history_sync_task = None
-_history_sync_state = {"last_run": None, "last_ok": None, "synced": 0, "exchange_closed_count": 0, "errors": []}
+_history_sync_state = {"last_run": None, "last_ok": None, "synced": 0, "exchange_closed_count": 0, "errors": [], "learning_errors": []}
 
 async def _history_sync_loop():
     """Continuously reconcile Bybit Closed PnL into the durable journal.
@@ -54,13 +54,19 @@ async def _history_sync_loop():
         try:
             if MODE in ("demo", "live"):
                 result = sync_closed_pnl_detailed(MODE, __import__("engine")._demo_closed_pnl(100))
-                record_lessons_from_closed(1000)
+                # Record the exchange->DB result before learning. Learning must never
+                # make a successful history sync look like a failed database sync.
                 _history_sync_state.update({
                     "last_run": time.time(), "last_ok": not bool(result.get("errors")),
                     "synced": int(result.get("synced", 0)),
                     "exchange_closed_count": int(result.get("exchange_closed_count", 0)),
                     "errors": list(result.get("errors", [])),
+                    "learning_errors": [],
                 })
+                try:
+                    record_lessons_from_closed(1000)
+                except Exception as le:
+                    _history_sync_state["learning_errors"] = [str(le)[:300]]
         except Exception as e:
             _history_sync_state.update({"last_run": time.time(), "last_ok": False, "errors": [str(e)]})
         await asyncio.sleep(30)
@@ -76,8 +82,11 @@ async def lifespan(_app):
     if MODE in ('demo','live'):
         try:
             result = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
-            record_lessons_from_closed(1000)
-            _history_sync_state.update({"last_run": time.time(), "last_ok": not bool(result.get("errors")), "synced": int(result.get("synced", 0)), "exchange_closed_count": int(result.get("exchange_closed_count", 0)), "errors": list(result.get("errors", []))})
+            _history_sync_state.update({"last_run": time.time(), "last_ok": not bool(result.get("errors")), "synced": int(result.get("synced", 0)), "exchange_closed_count": int(result.get("exchange_closed_count", 0)), "errors": list(result.get("errors", [])), "learning_errors": []})
+            try:
+                record_lessons_from_closed(1000)
+            except Exception as le:
+                _history_sync_state["learning_errors"] = [str(le)[:300]]
         except Exception as e:
             _history_sync_state.update({"last_run": time.time(), "last_ok": False, "errors": [str(e)]})
     _history_sync_task = asyncio.create_task(_history_sync_loop())
@@ -105,7 +114,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.18', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.20', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -191,7 +200,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.19', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.20', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -456,6 +465,7 @@ def history_sync_status():
         "exchange_closed_count": _history_sync_state.get("exchange_closed_count", 0),
         "synced": _history_sync_state.get("synced", 0),
         "errors": _history_sync_state.get("errors", []),
+        "learning_errors": _history_sync_state.get("learning_errors", []),
         "message": "Bybit Closed PnL is reconciled every 30 seconds into PostgreSQL." if MODE in ('demo','live') else "Paper mode does not use Bybit Closed PnL."
     }
 
