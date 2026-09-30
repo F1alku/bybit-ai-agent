@@ -218,3 +218,23 @@ The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-mar
 - UI now shows `PostgreSQL CONNECTED` only when a real PostgreSQL connection succeeds; merely having an environment variable is no longer treated as proof.
 - Startup logs print backend/configured/durable/connected status.
 - `/api/journal` and `/api/learning/lessons` report whether the current journal is durable.
+
+
+## v6.1.11 — Adaptive Position Exit
+- The configured risk percentage is a maximum planned loss, not a mandatory hold threshold.
+- Every AUTO cycle now re-evaluates open Demo/Live positions before looking for new entries.
+- The exit layer checks 5M/15M/1H direction, momentum, EMA20 alignment and confirmed high-impact news.
+- A position can be closed at a smaller loss than the configured risk when the original trade thesis is invalidated.
+- A profitable position can also be closed early when a confirmed reversal appears.
+- One noisy signal is not enough: the default exit requires multiple independent confirmations, with stronger treatment for simultaneous higher-timeframe + momentum reversal.
+- Hard exchange SL remains active as the final protection.
+- The existing +10% margin P&L partial close remains; if the thesis is still aligned, the remainder can be protected at breakeven.
+- The Trade Monitor UI now shows HOLD / TRAIL / REASSESS / EXIT and the reasons/signals behind the decision.
+
+
+## v6.1.11 Trade Thesis
+- Each open trade is evaluated as a testable thesis: why it was good, what confirms it now, and what invalidates it.
+- Initial/latest thesis is stored in the durable DB.
+- UI shows thesis health 0-100 plus reasons to continue and reasons to exit.
+- Strong setups expose a scale-in recommendation; size is NOT blindly increased without a separate risk-budget check.
+- Hard SL remains active.

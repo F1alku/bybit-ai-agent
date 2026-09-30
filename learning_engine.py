@@ -37,6 +37,11 @@ def init_learning_db():
             value TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS trade_thesis (
+            position_key TEXT PRIMARY KEY, symbol TEXT, side TEXT, entry_price REAL,
+            initial_score REAL, initial_reasons TEXT, latest_score REAL, latest_decision TEXT,
+            latest_positive TEXT, latest_negative TEXT, updated_at REAL
+        )''')
         cur.execute('''CREATE TABLE IF NOT EXISTS learning_lessons (
             external_id TEXT PRIMARY KEY,
             mode TEXT, symbol TEXT, side TEXT, strategy TEXT, outcome TEXT,
@@ -232,3 +237,16 @@ def build_learning_report(limit=1000):
         report['learning_status']='ANALYZABLE'
         report['note']='Insights are statistical suggestions only. Strategy parameters are not changed automatically.'
     return report
+
+
+def save_thesis(position_key, thesis, initial=False):
+    init_learning_db(); import json, time
+    key=str(position_key)
+    fields=(key,str(thesis.get('symbol') or ''),str(thesis.get('side') or ''),float(thesis.get('entry_price') or 0),float(thesis.get('thesis_health') or 0),json.dumps(thesis.get('positive_factors') or [],ensure_ascii=False),float(thesis.get('thesis_health') or 0),str(thesis.get('thesis_decision') or ''),json.dumps(thesis.get('positive_factors') or [],ensure_ascii=False),json.dumps(thesis.get('negative_factors') or [],ensure_ascii=False),time.time())
+    with _lock, _conn() as c:
+        cur=c.cursor()
+        if str(c.__class__.__module__).startswith('psycopg'):
+            cur.execute("""INSERT INTO trade_thesis(position_key,symbol,side,entry_price,initial_score,initial_reasons,latest_score,latest_decision,latest_positive,latest_negative,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(position_key) DO UPDATE SET latest_score=EXCLUDED.latest_score,latest_decision=EXCLUDED.latest_decision,latest_positive=EXCLUDED.latest_positive,latest_negative=EXCLUDED.latest_negative,updated_at=EXCLUDED.updated_at""",fields)
+        else:
+            cur.execute("""INSERT INTO trade_thesis(position_key,symbol,side,entry_price,initial_score,initial_reasons,latest_score,latest_decision,latest_positive,latest_negative,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(position_key) DO UPDATE SET latest_score=excluded.latest_score,latest_decision=excluded.latest_decision,latest_positive=excluded.latest_positive,latest_negative=excluded.latest_negative,updated_at=excluded.updated_at""",fields)
+    return True

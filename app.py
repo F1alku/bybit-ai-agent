@@ -72,7 +72,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.8', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.10', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -423,6 +423,14 @@ def trade_open(req: PaperOpenRequest):
         return paper_open(req.model_dump())
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get('/api/trades/thesis')
+def trades_thesis():
+    try:
+        import engine
+        return {'ok':True,'positions':[engine._position_exit_analysis(p) for p in engine.exchange_positions()]}
+    except Exception as e:
+        return {'ok':False,'positions':[],'error':str(e)}
 
 @app.get('/api/trades/monitor')
 def trades_monitor():

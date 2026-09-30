@@ -1175,23 +1175,137 @@ def demo_open(d):
             'entry_timing': d.get('entry_timing'), 'news_impact': d.get('news_impact'),
             'planned_risk': actual_risk, 'entry_price': entry, 'stop_loss': sl, 'take_profit': tp
         })
+        try:
+            from thesis_engine import analyze_position
+            from learning_engine import save_thesis
+            key=f"{symbol}:{side}:{entry}"
+            t=analyze_position({'symbol':symbol,'side':'Buy' if side=='LONG' else 'Sell','avgPrice':entry,'markPrice':entry,'positionIM':margin,'unrealisedPnl':0})
+            save_thesis(key,t,initial=True)
+        except Exception:
+            pass
     except Exception:
         pass
     return {'mode':MODE,'ok':True,'symbol':symbol,'side':side,'qty':qty,'margin_required':margin,'available_balance':available,'equity':equity,'bot_capital':cap,'leverage':leverage,'actual_risk_usdt':actual_risk,'min_notional':constraints['min_notional'],'max_leverage':constraints['max_leverage'],'order':result}
 
 
+def _legacy_position_exit_analysis(p):
+    """Decide whether an open position should be closed before its hard SL/TP.
+
+    The configured entry risk is a *maximum planned loss*, not a mandatory loss
+    threshold.  This read-only analysis looks for thesis invalidation, confirmed
+    momentum reversal and high-impact news against the position.
+    """
+    symbol=str(p.get('symbol') or '').upper()
+    side='LONG' if p.get('side')=='Buy' else 'SHORT'
+    entry=float(p.get('avgPrice') or 0)
+    mark=float(p.get('markPrice') or entry)
+    margin=abs(float(p.get('positionIM') or 0))
+    upnl=float(p.get('unrealisedPnl') or 0)
+    pnl_pct=(upnl/max(margin,1e-9))*100 if margin else 0.0
+    result={
+        'symbol':symbol,'side':side,'decision':'HOLD','reason':'trend still aligned',
+        'pnl_on_margin_pct':round(pnl_pct,3),'confirmations':0,
+        'exit_score':0,'analysis_ok':True,
+    }
+    try:
+        f5=frame_features(klines(symbol,'5',80)); f15=frame_features(klines(symbol,'15',80)); f60=frame_features(klines(symbol,'60',80))
+        b5=bias(f5); b15=bias(f15); b60=bias(f60)
+        z5=f5.iloc[-1]; z15=f15.iloc[-1]; z60=f60.iloc[-1]
+        ret5=(float(f5.close.iloc[-1])/float(f5.close.iloc[-4])-1)*100 if len(f5)>=4 else 0.0
+        ret15=(float(f15.close.iloc[-1])/float(f15.close.iloc[-2])-1)*100 if len(f15)>=2 else 0.0
+        ret60=(float(f60.close.iloc[-1])/float(f60.close.iloc[-2])-1)*100 if len(f60)>=2 else 0.0
+        opposite='SHORT' if side=='LONG' else 'LONG'
+        opp_count=sum(1 for b in (b5,b15,b60) if b==opposite)
+        aligned_count=sum(1 for b in (b5,b15,b60) if b==side)
+        momentum_opposite = (ret5 <= -0.12 and ret15 <= -0.20) if side=='LONG' else (ret5 >= 0.12 and ret15 >= 0.20)
+        htf_opposite = b15==opposite and b60==opposite
+        htf_aligned = b15==side and b60==side
+        ema20_opposite = (float(z5.close) < float(z5.ema20) and float(z15.close) < float(z15.ema20)) if side=='LONG' else (float(z5.close) > float(z5.ema20) and float(z15.close) > float(z15.ema20))
+        rsi_extreme = (float(z5.rsi)<42 and float(z15.rsi)<45) if side=='LONG' else (float(z5.rsi)>58 and float(z15.rsi)>55)
+        news=news_snapshot(symbol=symbol)
+        news_opposite=False
+        top=(news.get('top') or [])
+        for item in top:
+            if item.get('relevance_level')=='high' and item.get('market_confirmed'):
+                sentiment=item.get('sentiment')
+                news_opposite=(side=='LONG' and sentiment=='bearish') or (side=='SHORT' and sentiment=='bullish')
+                if news_opposite: break
+
+        confirmations=0; reasons=[]
+        if htf_opposite:
+            confirmations += 1; reasons.append('15M+1H trend против позиции')
+        if momentum_opposite:
+            confirmations += 1; reasons.append('5M+15M momentum развернулся')
+        if ema20_opposite:
+            confirmations += 1; reasons.append('цена ниже/выше EMA20 на 5M+15M')
+        if news_opposite:
+            confirmations += 1; reasons.append('подтверждённая новость против позиции')
+
+        # Do not exit on one noisy candle. Two independent confirmations are
+        # required, except for a strong higher-timeframe invalidation combined
+        # with an adverse momentum/EMA signal.
+        should_exit = confirmations >= 2
+        # A profitable trade gets a slightly more protective exit when both
+        # higher-timeframe trend and momentum have reversed.
+        if htf_opposite and momentum_opposite:
+            should_exit=True
+        # A losing trade can be cut early once the original thesis is clearly gone.
+        if pnl_pct < 0 and htf_opposite and ema20_opposite:
+            should_exit=True
+
+        result.update({
+            'decision':'EXIT' if should_exit else ('HOLD / TRAIL' if htf_aligned and aligned_count>=2 else 'REASSESS'),
+            'reason':'; '.join(reasons) if should_exit else ('trend aligned' if htf_aligned else 'mixed signals'),
+            'confirmations':confirmations,
+            'exit_score':min(100, confirmations*25 + (20 if htf_opposite and momentum_opposite else 0)),
+            'momentum_5m_pct':round(ret5,4),'momentum_15m_pct':round(ret15,4),'momentum_60m_pct':round(ret60,4),
+            'bias_5m':b5,'bias_15m':b15,'bias_1h':b60,
+            'ema20_opposite':ema20_opposite,'news_opposite':news_opposite,
+            'news_impact':news.get('impact'),'news_status':news.get('status'),
+            'atr_pct_5m':round(float(z5.atr_pct or 0),3),
+        })
+        return result
+    except Exception as e:
+        result.update({'analysis_ok':False,'decision':'HOLD / REASSESS','reason':f'analysis unavailable: {str(e)[:180]}'})
+        return result
+
+
+
+def _position_exit_analysis(p):
+    base=_legacy_position_exit_analysis(p)
+    try:
+        from thesis_engine import analyze_position
+        t=analyze_position(p)
+        symbol=str(p.get('symbol') or '').upper(); side='LONG' if p.get('side')=='Buy' else 'SHORT'; entry=float(p.get('avgPrice') or 0)
+        try:
+            from learning_engine import save_thesis
+            save_thesis(f"{symbol}:{side}:{entry}",t)
+        except Exception: pass
+        decision=base.get('decision','REASSESS'); reason=base.get('reason','')
+        if t['thesis_decision']=='EXIT' and (t['thesis_health']<=34 or t['opposed_timeframes']>=2):
+            decision='EXIT'; reason='; '.join(t['negative_factors']) or 'торговая гипотеза сделки больше не подтверждается'
+        elif t['thesis_decision']=='STRONG_HOLD' and decision!='EXIT':
+            decision='HOLD / TRAIL'; reason='; '.join(t['positive_factors'][:4]) or 'гипотеза сделки остаётся сильной'
+        elif t['thesis_decision']=='REDUCE_RISK / REASSESS' and decision!='EXIT':
+            decision='REASSESS'; reason='; '.join(t['negative_factors'][:3]) or 'гипотеза сделки ослабла'
+        base.update(t); base['decision']=decision; base['reason']=reason
+        base['thesis_action']='CONTINUE' if t['thesis_decision']=='STRONG_HOLD' else ('EXIT' if decision=='EXIT' else 'WATCH')
+        base['scale_in_recommendation']=bool(t['thesis_health']>=85 and t['pnl_on_margin_pct']>=2 and t['opposed_timeframes']==0 and not t['news_against'])
+        return base
+    except Exception as e:
+        base['thesis_error']=str(e)[:180]; return base
+
 def _partial_take_profit_key(p):
     return f"partial_tp_10:{p.get('symbol')}:{p.get('side')}:{p.get('avgPrice')}"
 
 def manage_open_positions():
-    """Manage open Demo positions after entry.
+    """Actively manage open Demo/Live positions.
 
-    At +10% unrealised P&L on position margin, lock in a 10% quantity partial
-    close once per position. The remaining position is then re-evaluated from
-    5m momentum. If the move is still aligned, protect the remainder by moving
-    SL to breakeven (never loosen an existing SL). If momentum is against the
-    position, leave the hard stop in force and mark EXIT REVIEW for the next
-    cycle.
+    Hard SL remains the last-resort protection. Before it is reached, the agent
+    may close the position when the trade thesis is invalidated by multiple
+    independent market signals. Conversely, aligned positions are held/trail-
+    managed rather than being forced out merely because the configured risk
+    percentage has not been reached.
     """
     if MODE not in ('demo','live'):
         return {'ok': True, 'mode': MODE, 'actions': []}
@@ -1206,7 +1320,28 @@ def manage_open_positions():
             margin=abs(float(p.get('positionIM') or 0)); upnl=float(p.get('unrealisedPnl') or 0)
             if size<=0 or entry<=0 or margin<=0:
                 continue
-            pnl_pct=(upnl/margin)*100
+
+            analysis=_position_exit_analysis(p)
+            if analysis.get('decision')=='EXIT':
+                symbol=str(p.get('symbol')); side=str(p.get('side'))
+                close_side='Sell' if side=='Buy' else 'Buy'
+                order=bybit_private_post('/v5/order/create',{
+                    'category':'linear','symbol':symbol,'side':close_side,'orderType':'Market','qty':str(size),
+                    'positionIdx':int(p.get('positionIdx') or 0),'reduceOnly':True,'closeOnTrigger':True,
+                    'orderLinkId':f'ai-adaptive-exit-{int(time.time()*1000)}'
+                })
+                actions.append({
+                    'symbol':symbol,'action':'ADAPTIVE_EXIT','closed_qty':size,
+                    'pnl_on_margin_pct':round((upnl/max(margin,1e-9))*100,3),
+                    'reason':analysis.get('reason'),'analysis':analysis,'order':order
+                })
+                _invalidate_demo_account_cache()
+                continue
+
+            # Profit protection: once +10% on occupied margin is reached, take
+            # the existing 10% partial and then move the hard SL to breakeven if
+            # the thesis is still aligned. This is independent of entry risk_pct.
+            pnl_pct=(upnl/max(margin,1e-9))*100
             if pnl_pct < 10.0:
                 continue
             key=_partial_take_profit_key(p)
@@ -1215,12 +1350,9 @@ def manage_open_positions():
             symbol=str(p.get('symbol')); side=str(p.get('side'))
             qty_step,min_qty,_max_qty=_symbol_rules(symbol)
             partial=size*0.10
-            if qty_step>0:
-                partial=_round_step(partial,qty_step)
-            if min_qty>0 and partial<min_qty:
-                partial=min_qty
-            if partial<=0 or partial>size:
-                continue
+            if qty_step>0: partial=_round_step(partial,qty_step)
+            if min_qty>0 and partial<min_qty: partial=min_qty
+            if partial<=0 or partial>size: continue
             close_side='Sell' if side=='Buy' else 'Buy'
             order=bybit_private_post('/v5/order/create',{
                 'category':'linear','symbol':symbol,'side':close_side,'orderType':'Market','qty':str(partial),
@@ -1228,63 +1360,51 @@ def manage_open_positions():
                 'orderLinkId':f'ai-partial10-{int(time.time()*1000)}'
             })
             set_setting(key,'1')
-            actions.append({'symbol':symbol,'action':'PARTIAL_TP_10','closed_qty':partial,'position_qty':size,'pnl_on_margin_pct':round(pnl_pct,3),'order':order})
-            # Reassess the remainder after the partial close.
-            try:
-                k=klines(symbol,'5',60); ff=frame_features(k)
-                ret_3=(float(k.close.iloc[-1])/float(k.close.iloc[-4])-1)*100 if len(k)>=4 else 0.0
-                bias='LONG' if ret_3>0.15 else 'SHORT' if ret_3<-0.15 else 'NEUTRAL'
-            except Exception:
-                bias='UNKNOWN'
-            aligned=(bias==('LONG' if side=='Buy' else 'SHORT'))
-            current_sl=float(p.get('stopLoss') or 0)
-            if aligned:
-                # Move SL to entry only when that improves protection.
+            action={'symbol':symbol,'action':'PARTIAL_TP_10','closed_qty':partial,'position_qty':size,'pnl_on_margin_pct':round(pnl_pct,3),'order':order,'analysis':analysis}
+            if analysis.get('decision')=='HOLD / TRAIL':
+                current_sl=float(p.get('stopLoss') or 0)
                 improve=(side=='Buy' and (current_sl<=0 or current_sl<entry)) or (side=='Sell' and (current_sl<=0 or current_sl>entry))
                 if improve:
                     bybit_private_post('/v5/position/trading-stop',{
                         'category':'linear','symbol':symbol,'positionIdx':int(p.get('positionIdx') or 0),
                         'stopLoss':str(entry),'slTriggerBy':'MarkPrice'
                     })
-                    actions[-1]['remainder']='HOLD/TRAIL; SL moved to breakeven'
+                    action['remainder']='HOLD/TRAIL; SL moved to breakeven'
                 else:
-                    actions[-1]['remainder']='HOLD/TRAIL'
+                    action['remainder']='HOLD/TRAIL'
             else:
-                actions[-1]['remainder']='EXIT REVIEW; hard SL remains active'
+                action['remainder']='REASSESS'
+            actions.append(action)
             _invalidate_demo_account_cache()
         except Exception as e:
             actions.append({'symbol':p.get('symbol'),'action':'MANAGEMENT_ERROR','error':str(e)})
     return {'ok':True,'mode':MODE,'actions':actions,'checked_at':int(time.time()*1000)}
 
 def trade_monitor_snapshot():
-    """Reassess currently open exchange positions without changing them.
-    The actual automatic position manager is called by AUTO, not by this read-only endpoint.
-    """
+    """Read-only view of the adaptive position analysis."""
     if MODE not in ('demo','live'):
         return {'ok': True, 'mode': 'paper', 'positions': []}
     positions = exchange_positions()
-    news = news_snapshot()
     out=[]
     for p in positions:
-        symbol=p.get('symbol'); side='LONG' if p.get('side')=='Buy' else 'SHORT'
-        mark=float(p.get('markPrice') or p.get('avgPrice') or 0); avg=float(p.get('avgPrice') or 0)
-        upnl=float(p.get('unrealisedPnl') or 0); margin=abs(float(p.get('positionIM') or 0));
-        pnl_pct=(upnl/max(margin,1e-9))*100 if margin else 0.0
+        symbol=p.get('symbol')
         try:
-            k=klines(symbol,'5',60)
-            ff=frame_features(k)
-            ret_3=(float(k.close.iloc[-1])/float(k.close.iloc[-4])-1)*100 if len(k)>=4 else 0.0
-            atr_pct=float(ff.atr_pct.iloc[-1])
-            bias_5='LONG' if ret_3>0.15 else 'SHORT' if ret_3<-0.15 else 'NEUTRAL'
+            a=_position_exit_analysis(p)
         except Exception as e:
-            ret_3=0.0; atr_pct=0.0; bias_5='UNKNOWN'
-        aligned=(bias_5==side)
-        if pnl_pct >= 0.2 and aligned: decision='HOLD / TRAIL'
-        elif pnl_pct < 0 and aligned: decision='HOLD / REASSESS'
-        elif pnl_pct < -5 and not aligned: decision='EXIT REVIEW'
-        else: decision='REASSESS'
+            a={'decision':'HOLD / REASSESS','reason':str(e),'analysis_ok':False}
+        avg=float(p.get('avgPrice') or 0); mark=float(p.get('markPrice') or avg)
+        upnl=float(p.get('unrealisedPnl') or 0); margin=abs(float(p.get('positionIM') or 0))
         notional=abs(float(p.get('positionValue') or 0)) or abs(float(p.get('size') or 0))*mark
-        out.append({'symbol':symbol,'side':side,'avg_price':avg,'mark_price':mark,'size':float(p.get('size') or 0),'notional':round(notional,6),'margin':round(margin,6),'leverage':float(p.get('leverage') or 0),'stop_loss':float(p.get('stopLoss') or 0),'take_profit':float(p.get('takeProfit') or 0),'unrealised_pnl':upnl,'pnl_on_margin_pct':round(pnl_pct,3),'momentum_5m_pct':round(ret_3,4),'momentum_bias_5m':bias_5,'atr_pct':round(atr_pct,3),'idea_aligned':aligned,'decision':decision,'partial_take_profit_threshold_pct':10.0,'partial_take_profit_fraction':0.10,'news_status':news.get('status'),'news_impact':news.get('impact'),'hard_stop_note':'Hard capital/risk limits always override HOLD.'})
+        out.append({
+            'symbol':symbol,'side':'LONG' if p.get('side')=='Buy' else 'SHORT',
+            'avg_price':avg,'mark_price':mark,'size':float(p.get('size') or 0),'notional':round(notional,6),
+            'margin':round(margin,6),'leverage':float(p.get('leverage') or 0),
+            'stop_loss':float(p.get('stopLoss') or 0),'take_profit':float(p.get('takeProfit') or 0),
+            'unrealised_pnl':upnl,'pnl_on_margin_pct':round((upnl/max(margin,1e-9))*100,3) if margin else 0,
+            **a,
+            'partial_take_profit_threshold_pct':10.0,'partial_take_profit_fraction':0.10,
+            'hard_stop_note':'Hard SL remains active; adaptive EXIT can close earlier when the thesis is invalidated.'
+        })
     return {'ok':True,'mode':MODE,'positions':out,'checked_at':int(time.time()*1000)}
 
 def exchange_positions():
