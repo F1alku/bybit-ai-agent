@@ -1,4 +1,4 @@
-# v6.1.23 — Full History + Learning Backfill + Profit Ladder
+# v6.1.25 — Bybit Cursor Signing + Full History + Learning Backfill
 
 - Fixed staged profit-taking for open positions only.
 - Thresholds: +10/+20/+30/+40/+50% P&L relative to occupied margin.
@@ -30,7 +30,11 @@ History remains PostgreSQL-backed and Liquidity Intelligence remains restricted 
 - UI version labels are unified to 6.1.20.
 
 
-## v6.1.23 changes
+## v6.1.25 changes
+
+- Fixed Bybit private GET signing for paginated `cursor` values: cursor is fully normalized from repeated percent-encoding, encoded exactly once, and the exact signed query string is sent on the wire. This fixes Bybit 10004 `Error sign` caused by `%253A` / `%252C` double-encoding.
+- Added regression tests for signed cursor pagination.
+- 57 tests pass.
 - Full Bybit Closed PnL pagination for reconciliation (up to 500 rows per sync).
 - Existing closed trades are backfilled into `learning_lessons`; missing entry context never blocks a lesson.
 - Learning reconciliation reports closed rows, matched context, unmatched context and match method.

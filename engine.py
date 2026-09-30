@@ -106,6 +106,33 @@ def _put_cache(key, value):
     return value
 
 
+def _canonical_get_query(payload):
+    """Build the exact query string used both for Bybit signing and the HTTP URL.
+
+    Bybit's pagination cursor is already percent-encoded when returned by the API.
+    Passing that value to httpx as a params dict causes the percent signs to be
+    encoded a second time (%3A -> %253A), while the signature is expected to cover
+    the once-encoded query. Normalize cursor once, then encode the final query
+    exactly once and send that exact string on the wire.
+    """
+    from urllib.parse import urlencode, unquote
+    items = []
+    for k, v in sorted(payload.items(), key=lambda kv: str(kv[0])):
+        value = str(v)
+        if str(k) == 'cursor':
+            # Bybit can return nextPageCursor already percent-encoded, and in
+            # some responses it may arrive encoded more than once. Normalize
+            # it all the way back to its raw value before urlencode() adds the
+            # single encoding used both for the signature and wire URL.
+            for _ in range(4):
+                decoded = unquote(value)
+                if decoded == value:
+                    break
+                value = decoded
+        items.append((str(k), value))
+    return urlencode(items)
+
+
 def _auth_headers(method, path, payload):
     if MODE == 'demo':
         key, secret = DEMO_API_KEY, DEMO_API_SECRET
@@ -116,8 +143,7 @@ def _auth_headers(method, path, payload):
     if not key or not secret:
         return {}
     ts = str(int(time.time() * 1000)); recv = '5000'
-    from urllib.parse import urlencode
-    body = urlencode(sorted(payload.items())) if method == 'GET' else json.dumps(payload, separators=(',', ':'))
+    body = _canonical_get_query(payload) if method == 'GET' else json.dumps(payload, separators=(',', ':'))
     sign = hmac.new(secret.encode(), (ts + key + recv + body).encode(), hashlib.sha256).hexdigest()
     return {'X-BAPI-API-KEY': key, 'X-BAPI-TIMESTAMP': ts, 'X-BAPI-RECV-WINDOW': recv, 'X-BAPI-SIGN': sign}
 
@@ -139,7 +165,9 @@ def bybit_get(path, params):
     for attempt in range(RETRY_COUNT + 1):
         try:
             _pace_rest()
-            r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
+            query = _canonical_get_query(params)
+            url = BASE + path + (('?' + query) if query else '')
+            r = _http.get(url, headers=_auth_headers('GET', path, params))
             if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRY_COUNT:
                 retry_after = getattr(r, 'headers', {}).get('Retry-After')
                 try:
@@ -804,7 +832,9 @@ def bybit_private_get(path, params, retries=PRIVATE_RETRY_COUNT):
     for attempt in range(retries + 1):
         try:
             _pace_rest()
-            r = _http.get(BASE + path, params=params, headers=_auth_headers('GET', path, params))
+            query = _canonical_get_query(params)
+            url = BASE + path + (('?' + query) if query else '')
+            r = _http.get(url, headers=_auth_headers('GET', path, params))
             if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
                 retry_after = getattr(r, 'headers', {}).get('Retry-After')
                 try:
