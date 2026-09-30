@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 from contextlib import asynccontextmanager
+import asyncio
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -23,7 +24,6 @@ scan_lock = threading.Lock()
 scan_jobs = {}
 scan_jobs_lock = threading.Lock()
 scan_executor = ThreadPoolExecutor(max_workers=1)
-manual_scan_pending = None
 strategy_state = {'mode': os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both', 'normal_gate': int(get_setting('normal_gate', os.getenv('NORMAL_SCORE_GATE','70'))), 'scalp_gate': int(get_setting('scalp_gate', os.getenv('SCALP_SCORE_GATE','60')))}
 auto_state = {'enabled': bool(int(get_setting('auto_enabled', '1' if os.getenv('AUTO_ENABLED','false').lower() == 'true' else '0'))), 'last_run': 0.0, 'last_scan': None, 'last_action': 'starting', 'error': None, 'last_success': 0.0, 'last_duration_sec': None, 'pending': False, 'last_diagnostics': None}
 
@@ -42,8 +42,31 @@ def _apply_trading_settings():
 
 _apply_trading_settings()
 
+_history_sync_task = None
+_history_sync_state = {"last_run": None, "last_ok": None, "synced": 0, "exchange_closed_count": 0, "errors": []}
+
+async def _history_sync_loop():
+    """Continuously reconcile Bybit Closed PnL into the durable journal.
+    This runs inside the Render web process; worker.py is not required.
+    """
+    while True:
+        try:
+            if MODE in ("demo", "live"):
+                result = sync_closed_pnl_detailed(MODE, __import__("engine")._demo_closed_pnl(100))
+                record_lessons_from_closed(1000)
+                _history_sync_state.update({
+                    "last_run": time.time(), "last_ok": not bool(result.get("errors")),
+                    "synced": int(result.get("synced", 0)),
+                    "exchange_closed_count": int(result.get("exchange_closed_count", 0)),
+                    "errors": list(result.get("errors", [])),
+                })
+        except Exception as e:
+            _history_sync_state.update({"last_run": time.time(), "last_ok": False, "errors": [str(e)]})
+        await asyncio.sleep(30)
+
 @asynccontextmanager
 async def lifespan(_app):
+    global _history_sync_task
     init_db()
     init_learning_db()
     db = db_status()
@@ -51,10 +74,12 @@ async def lifespan(_app):
     _apply_trading_settings()
     if MODE in ('demo','live'):
         try:
-            sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
+            result = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
             record_lessons_from_closed(1000)
-        except Exception:
-            pass
+            _history_sync_state.update({"last_run": time.time(), "last_ok": not bool(result.get("errors")), "synced": int(result.get("synced", 0)), "exchange_closed_count": int(result.get("exchange_closed_count", 0)), "errors": list(result.get("errors", []))})
+        except Exception as e:
+            _history_sync_state.update({"last_run": time.time(), "last_ok": False, "errors": [str(e)]})
+    _history_sync_task = asyncio.create_task(_history_sync_loop())
     # v6.1: first deployment can opt Demo AUTO into the persistent setting once.
     # After the migration the user's manual ON/OFF choice remains authoritative.
     if os.getenv('AUTO_ENABLED','false').lower() == 'true' and get_setting('auto_migrated_v61') != '1':
@@ -66,6 +91,12 @@ async def lifespan(_app):
     try:
         yield
     finally:
+        if _history_sync_task:
+            _history_sync_task.cancel()
+            try:
+                await _history_sync_task
+            except asyncio.CancelledError:
+                pass
         if task is not None:
             task.cancel()
             try:
@@ -73,7 +104,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.14', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.16', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -89,31 +120,6 @@ async def json_error_middleware(request, call_next):
             'error_type': e.__class__.__name__,
             'path': request.url.path,
         })
-
-
-def _start_pending_manual_scan():
-    """Start one queued manual scan after AUTO/current scan releases the lock."""
-    global manual_scan_pending
-    with scan_jobs_lock:
-        pending = manual_scan_pending
-        manual_scan_pending = None
-    if not pending:
-        return
-    job_id, interval, limit_symbols, entry_threshold, strategy, full_market = pending
-    if not scan_lock.acquire(blocking=False):
-        # Extremely short race with another cycle; put it back for the next release.
-        with scan_jobs_lock:
-            manual_scan_pending = pending
-        return
-    try:
-        with scan_jobs_lock:
-            if job_id in scan_jobs:
-                scan_jobs[job_id]['status'] = 'running'
-        scan_executor.submit(_run_scan_job, job_id, interval, limit_symbols, entry_threshold, strategy, full_market)
-    except Exception as e:
-        scan_lock.release()
-        with scan_jobs_lock:
-            scan_jobs[job_id] = {'status':'error','error':f'Не удалось поставить скан в очередь: {e}','error_type':e.__class__.__name__}
 
 
 def _auto_iteration():
@@ -147,7 +153,6 @@ def _auto_iteration():
             auto_state['last_duration_sec'] = round(time.time() - started, 2)
     finally:
         scan_lock.release()
-        _start_pending_manual_scan()
 
 
 async def _auto_loop():
@@ -185,7 +190,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.14', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.8', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -328,7 +333,6 @@ def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy, fu
             scan_jobs[job_id] = {'status': 'error', 'error': str(e), 'error_type': e.__class__.__name__}
     finally:
         scan_lock.release()
-        _start_pending_manual_scan()
         with auto_lock:
             should_run_auto = bool(auto_state.get('enabled') and auto_state.get('pending'))
             if should_run_auto:
@@ -339,24 +343,11 @@ def _run_scan_job(job_id, interval, limit_symbols, entry_threshold, strategy, fu
 
 @app.post('/api/scan')
 def scan(req: ScanRequest):
-    global manual_scan_pending
+    if not scan_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail='Скан уже выполняется. Подожди завершения текущего цикла.')
     job_id = uuid.uuid4().hex[:12]
     with scan_jobs_lock:
-        scan_jobs[job_id] = {'status': 'queued', 'interval': req.interval, 'limit_symbols': req.limit_symbols}
-    # If AUTO/current scan owns the lock, queue exactly one manual request instead
-    # of returning a permanent 409. The request starts immediately after the
-    # current cycle releases the lock. This prevents the UI from getting stuck
-    # on "scan already running" when AUTO is enabled.
-    if not scan_lock.acquire(blocking=False):
-        with scan_jobs_lock:
-            if manual_scan_pending is not None:
-                scan_jobs[job_id] = {'status':'error','error':'Другой ручной скан уже стоит в очереди.','error_type':'ScanAlreadyQueued'}
-                return {'ok': True, 'job_id': job_id, 'status': 'error'}
-            manual_scan_pending = (job_id, req.interval, req.limit_symbols, strategy_state['scalp_gate'] if strategy_state['mode']=='scalp' else strategy_state['normal_gate'], strategy_state['mode'], bool(req.full_market and req.limit_symbols == 0))
-            scan_jobs[job_id]['queued_behind'] = 'current AUTO/manual scan'
-        return {'ok': True, 'job_id': job_id, 'status': 'queued'}
-    with scan_jobs_lock:
-        scan_jobs[job_id]['status'] = 'running'
+        scan_jobs[job_id] = {'status': 'running', 'interval': req.interval, 'limit_symbols': req.limit_symbols}
         # Keep only the newest 20 job records so a long-lived Render instance cannot grow memory forever.
         if len(scan_jobs) > 20:
             for old_id in list(scan_jobs)[:-20]:
@@ -447,6 +438,22 @@ def learning_lessons():
         return {'ok': False, 'lessons': [], 'error': str(e)}
 
 
+@app.get('/api/history-sync')
+def history_sync_status():
+    """Show the exact exchange-to-DB synchronization state; never hides errors."""
+    db = db_status()
+    return {
+        "ok": True,
+        "mode": MODE,
+        "database": db,
+        "last_run": _history_sync_state.get("last_run"),
+        "last_ok": _history_sync_state.get("last_ok"),
+        "exchange_closed_count": _history_sync_state.get("exchange_closed_count", 0),
+        "synced": _history_sync_state.get("synced", 0),
+        "errors": _history_sync_state.get("errors", []),
+        "message": "Bybit Closed PnL is reconciled every 30 seconds into PostgreSQL." if MODE in ('demo','live') else "Paper mode does not use Bybit Closed PnL."
+    }
+
 @app.get('/api/journal')
 def journal():
     try:
@@ -459,6 +466,7 @@ def journal():
             'ok': True, 'mode': MODE, 'durable_journal': bool(db.get('durable')),
             'db_backend': db.get('backend'), 'db_error': db.get('error'),
             'exchange_closed_count': sync.get('exchange_closed_count', 0),
+            'history_sync': _history_sync_state,
             'synced_count': sync.get('synced', 0), 'sync_errors': sync.get('errors', []),
             'db_trade_count': len(trades), 'trades': trades
         }

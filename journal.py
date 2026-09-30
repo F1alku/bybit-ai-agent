@@ -116,7 +116,7 @@ def init_db():
 
 def upsert_closed_pnl(mode, item):
     import json
-    ext = str(item.get('orderId') or item.get('orderLinkId') or item.get('execId') or f"{item.get('symbol')}:{item.get('updatedTime')}:{item.get('closedPnl')}")
+    ext = str(item.get('execId') or item.get('orderId') or item.get('orderLinkId') or f"{item.get('symbol')}:{item.get('updatedTime')}:{item.get('closedPnl')}")
     row = (
         ext, mode, str(item.get('symbol') or ''), str(item.get('side') or ''),
         float(item.get('qty') or 0), float(item.get('avgEntryPrice') or item.get('entryPrice') or 0),
