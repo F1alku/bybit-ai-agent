@@ -105,3 +105,36 @@ def test_adaptive_learning_is_bounded_and_needs_samples(monkeypatch, tmp_path):
                 cur.execute('INSERT INTO learning_lessons VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',row)
     r=learning_engine.adaptive_adjustment('normal','LONG',85)
     assert r['samples']==10 and -5.0 <= r['adjustment'] <= 5.0 and r['confidence'] > 0
+
+
+def test_learning_schema_migration_creates_missing_tables_and_columns(tmp_path, monkeypatch):
+    import journal, learning_engine
+    db=tmp_path/'migration.db'
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(db))
+    journal.init_db()
+    learning_engine.init_learning_db()
+    with journal._lock, journal._conn() as c:
+        cur=c.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='learning_trade_meta'")
+        assert cur.fetchone()
+        cur.execute('PRAGMA table_info(learning_trade_meta)')
+        cols={r[1] for r in cur.fetchall()}
+        assert {'external_id','stop_loss','take_profit','entry_price'} <= cols
+
+
+def test_history_remains_readable_when_learning_read_fails(tmp_path, monkeypatch):
+    import journal, app
+    db=tmp_path/'history-isolation.db'
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(db))
+    journal.init_db()
+    journal.upsert_closed_pnl('demo', {'execId':'HIST-1','symbol':'BTCUSDT','side':'Buy','qty':'1','avgEntryPrice':'100','avgExitPrice':'101','closedPnl':'1','createdTime':'1','updatedTime':'2'})
+    monkeypatch.setattr(app, 'learning_counts', lambda: (_ for _ in ()).throw(RuntimeError('learning unavailable')))
+    from fastapi.testclient import TestClient
+    c=TestClient(app.app)
+    r=c.get('/api/journal')
+    assert r.status_code == 200
+    body=r.json()
+    assert body['ok'] is True
+    assert body['db_trade_count'] == 1
+    assert body['trades'][0]['external_id'] == 'HIST-1'
+    assert 'learning unavailable' in body['learning_error']

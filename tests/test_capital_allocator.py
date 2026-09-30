@@ -11,7 +11,8 @@ def test_two_signals_share_risk_and_capital_by_score():
     rows=allocate([{"symbol":"AUSDT","score":95},{"symbol":"BUSDT","score":75}],100)
     assert len(rows)==2
     assert rows[0]["allocation"]["capital_pct"] > rows[1]["allocation"]["capital_pct"]
-    assert abs(sum(x["allocation"]["risk_pct_of_bot"] for x in rows)-10.0) < 1e-9
+    assert all(x["allocation"]["risk_pct_of_bot"] == 10.0 for x in rows)
+    assert abs(sum(x["allocation"]["risk_pct_of_bot"] for x in rows)-20.0) < 1e-9
     assert abs(sum(x["allocation"]["capital_pct"] for x in rows)-90.0) < 1e-9
 
 def test_three_entries_are_capped_and_leave_reserve():
@@ -19,3 +20,4 @@ def test_three_entries_are_capped_and_leave_reserve():
     assert len(rows)==3
     check=validate_allocations(rows)
     assert check["risk_ok"] and check["concentration_ok"] and check["reserve_pct"] == 10.0
+    assert check["aggregate_risk_pct"] == 30.0

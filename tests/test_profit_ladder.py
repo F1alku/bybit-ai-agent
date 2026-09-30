@@ -13,3 +13,10 @@ def test_profit_ladder_lock_price_long_short():
     short_p = engine._profit_lock_price(100.0, 100.0, 1000.0, 'Sell', 10.0)
     assert long_p == 101.0
     assert short_p == 99.0
+
+
+def test_dynamic_profit_protection_tracks_peak_after_50_percent():
+    assert engine._profit_peak_lock_pct(49) is None
+    assert engine._profit_peak_lock_pct(50) == 40.0
+    assert engine._profit_peak_lock_pct(70) == 55.0
+    assert engine._profit_peak_lock_pct(100) == 85.0

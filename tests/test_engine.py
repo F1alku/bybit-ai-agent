@@ -391,7 +391,7 @@ def test_final_portfolio_policy_overrides_manual_risk_leverage(monkeypatch, tmp_
     j = r.json()
     assert j['risk_pct'] == 10.0
     assert j['default_leverage'] == 10.0
-    assert j['total_open_risk_pct'] == 10.0
+    assert j['total_open_risk_pct'] == 0.0
     assert j['daily_loss_limit_usdt'] == 75
     assert j['paper_daily_loss_pct'] == 15
 
@@ -439,8 +439,8 @@ def test_trading_config_api_persists_and_applies(monkeypatch, tmp_path):
     r = c.post('/api/trading-config', json={'max_positions': 6, 'risk_pct': 1.5, 'leverage': 25, 'total_open_risk_pct': 7.5, 'auto_interval_sec': 90, 'daily_loss_limit_usdt': 35, 'paper_daily_loss_pct': 12})
     assert r.status_code == 200
     j = r.json()
-    assert j['max_positions'] == 6 and j['risk_pct'] == 10.0 and j['default_leverage'] == 10.0 and j['total_open_risk_pct'] == 10.0 and j['auto_interval_sec'] == 90 and j['daily_loss_limit_usdt'] == 35 and j['paper_daily_loss_pct'] == 12
-    assert engine.MAX_POSITIONS == 6 and engine.RISK_PCT_DEFAULT == 10.0 and engine.LEVERAGE == 10.0 and engine.TOTAL_OPEN_RISK_PCT == 10.0 and engine.DEMO_MAX_DAILY_LOSS == 35 and engine.DAILY_LOSS_LIMIT_PCT == 12
+    assert j['max_positions'] == 6 and j['risk_pct'] == 10.0 and j['default_leverage'] == 10.0 and j['total_open_risk_pct'] == 0.0 and j['risk_scope'] == 'per_trade' and j['auto_interval_sec'] == 90 and j['daily_loss_limit_usdt'] == 35 and j['paper_daily_loss_pct'] == 12
+    assert engine.MAX_POSITIONS == 6 and engine.RISK_PCT_DEFAULT == 10.0 and engine.LEVERAGE == 10.0 and engine.TOTAL_OPEN_RISK_PCT == 0.0 and engine.DEMO_MAX_DAILY_LOSS == 35 and engine.DAILY_LOSS_LIMIT_PCT == 12
     assert journal.get_setting('max_positions') == '6' and journal.get_setting('risk_pct') == '10.0'
     engine.MAX_POSITIONS, engine.RISK_PCT_DEFAULT, engine.LEVERAGE, engine.TOTAL_OPEN_RISK_PCT = original
 
