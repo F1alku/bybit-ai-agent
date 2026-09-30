@@ -220,7 +220,11 @@ def record_lessons_from_closed(limit=1000):
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(external_id) DO UPDATE SET mode=excluded.mode,symbol=excluded.symbol,side=excluded.side,strategy=excluded.strategy,outcome=excluded.outcome,net_pnl=excluded.net_pnl,r_multiple=excluded.r_multiple,score=excluded.score,planned_risk=excluded.planned_risk,lesson=excluded.lesson,what_went_right=excluded.what_went_right,what_went_wrong=excluded.what_went_wrong""", row)
         lessons.append({'external_id':key,'outcome':outcome,'net_pnl':net,'r_multiple':r_mult,'lesson':lesson,'what_went_right':' '.join(right),'what_went_wrong':' '.join(wrong),'context_found':bool(m),'match_method':match_method})
-    return {'created_or_updated':len(lessons),'closed_rows':len(rows),'matched_context':matched,'unmatched_context':unmatched,'match_methods':match_methods,'lessons':lessons}
+    with _lock, _conn() as c:
+        cur=c.cursor()
+        cur.execute('SELECT COUNT(*) FROM learning_lessons')
+        lesson_total=int((cur.fetchone() or [0])[0] or 0)
+    return {'created_or_updated':len(lessons),'lesson_total':lesson_total,'closed_rows':len(rows),'matched_context':matched,'unmatched_context':unmatched,'match_methods':match_methods,'lessons':lessons}
 
 
 def recent_lessons(limit=50):

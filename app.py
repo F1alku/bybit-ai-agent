@@ -114,7 +114,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.24', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.26', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -200,7 +200,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.24', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.26', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -431,8 +431,9 @@ def database_status():
 @app.get('/api/learning')
 def learning():
     try:
-        if MODE in ('demo','live'):
-            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(500))
+        # UI reads the durable journal only. Bybit reconciliation and learning
+        # backfill run in the background loop, so opening the page never waits
+        # for a signed exchange request.
         report=build_learning_report(1000)
         report['durable_journal']=bool(db_status().get('durable'))
         if not report['durable_journal']:
@@ -444,10 +445,9 @@ def learning():
 @app.get('/api/learning/lessons')
 def learning_lessons():
     try:
-        if MODE in ('demo','live'):
-            sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(500))
-            record_lessons_from_closed(1000)
-        return {'ok': True, 'durable_journal': bool(db_status().get('durable')), 'lessons': recent_lessons(100)}
+        # Backfill is DB-only here. No Bybit request is allowed on a page read.
+        sync = record_lessons_from_closed(1000)
+        return {'ok': True, 'durable_journal': bool(db_status().get('durable')), 'lesson_sync': {k: sync.get(k, 0) for k in ('created_or_updated','lesson_total','closed_rows','matched_context','unmatched_context','match_methods')}, 'lessons': recent_lessons(100)}
     except Exception as e:
         return {'ok': False, 'lessons': [], 'error': str(e)}
 
@@ -472,27 +472,29 @@ def history_sync_status():
 @app.get('/api/journal')
 def journal():
     try:
-        sync = {'synced': 0, 'exchange_closed_count': 0, 'errors': []}
-        if MODE in ('demo','live'):
-            sync = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(500))
+        # Critical performance rule: never call Bybit from this endpoint.
+        # The background history loop owns exchange reconciliation; this endpoint
+        # serves durable PostgreSQL/SQLite state immediately.
         db = db_status()
-        trades = journal_recent(500)
+        trades = journal_recent(100)
         try:
-            from learning_engine import record_lessons_from_closed
-            learning_sync = record_lessons_from_closed(500)
+            learning_sync = record_lessons_from_closed(1000)
+            lessons = recent_lessons(50)
         except Exception as e:
             learning_sync = {'closed_rows': len(trades), 'created_or_updated': 0, 'matched_context': 0, 'unmatched_context': len(trades), 'errors': [str(e)]}
+            lessons = []
         return {
             'ok': True, 'mode': MODE, 'durable_journal': bool(db.get('durable')),
             'db_backend': db.get('backend'), 'db_error': db.get('error'),
-            'exchange_closed_count': sync.get('exchange_closed_count', 0),
+            'exchange_closed_count': _history_sync_state.get('exchange_closed_count', 0),
             'history_sync': _history_sync_state,
-            'synced_count': sync.get('synced', 0), 'sync_errors': sync.get('errors', []),
+            'synced_count': _history_sync_state.get('synced', 0),
+            'sync_errors': _history_sync_state.get('errors', []),
             'db_trade_count': len(trades), 'trades': trades,
-            'learning_sync': learning_sync
+            'learning_sync': learning_sync, 'lessons': lessons
         }
     except Exception as e:
-        return {'ok': False, 'mode': MODE, 'trades': [], 'error': str(e)}
+        return {'ok': False, 'mode': MODE, 'trades': [], 'lessons': [], 'error': str(e)}
 
 @app.post('/api/trade/open')
 def trade_open(req: PaperOpenRequest):
