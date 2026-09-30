@@ -35,6 +35,33 @@ def _conn():
             c.close()
 
 
+
+
+def db_status():
+    """Return a safe, non-secret health/status snapshot for the journal DB."""
+    configured = bool(DATABASE_URL)
+    backend = 'postgresql' if _is_pg() else 'sqlite'
+    try:
+        with _lock, _conn() as c:
+            cur = c.cursor()
+            cur.execute('SELECT 1')
+            ok = bool(cur.fetchone())
+        return {
+            'ok': ok,
+            'configured': configured,
+            'backend': backend,
+            'durable': backend == 'postgresql' and ok,
+            'error': None,
+        }
+    except Exception as e:
+        return {
+            'ok': False,
+            'configured': configured,
+            'backend': backend,
+            'durable': False,
+            'error': str(e),
+        }
+
 def init_db():
     with _lock, _conn() as c:
         cur = c.cursor()

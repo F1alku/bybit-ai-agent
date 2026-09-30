@@ -203,7 +203,7 @@ The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-mar
 - Existing NORMAL/SCALP scanner and AUTO logic was not intentionally changed by this release.
 
 
-## Overnight learning and restart safety — v6.1.8
+## Overnight learning and restart safety — v6.1.9
 
 - Every successful Demo entry stores entry context (strategy, score, risk, leverage, regime, timing, news, SL/TP).
 - Closed Bybit PnL is synchronized into the journal and converted into a persistent post-trade lesson: outcome, net PnL, R-multiple, what went right and what went wrong.
@@ -213,8 +213,8 @@ The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-mar
 - Startup synchronizes recent closed PnL and rebuilds the learning lesson cache before AUTO begins.
 
 
-### v6.1.9 — Market quantity execution fix
-For Bybit Market orders, the execution layer now uses `maxMktOrderQty` from
-`lotSizeFilter` (falling back to `maxOrderQty` only when the market-specific
-limit is unavailable). Quantity is re-normalized to `qtyStep` after the
-exchange maximum clamp and checked again before `/v5/order/create`.
+## v6.1.9 persistence diagnostics
+- Added `/api/db-status`, which performs a real database `SELECT 1` health check and never exposes `DATABASE_URL`.
+- UI now shows `PostgreSQL CONNECTED` only when a real PostgreSQL connection succeeds; merely having an environment variable is no longer treated as proof.
+- Startup logs print backend/configured/durable/connected status.
+- `/api/journal` and `/api/learning/lessons` report whether the current journal is durable.

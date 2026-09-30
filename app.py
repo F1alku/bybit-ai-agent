@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position, trade_monitor_snapshot, bot_capital_config, set_bot_capital
-from journal import init_db, recent as journal_recent, sync_closed_pnl, get_setting, set_setting
+from journal import init_db, recent as journal_recent, sync_closed_pnl, get_setting, set_setting, db_status
 from learning_engine import build_learning_report, init_learning_db, record_lessons_from_closed, recent_lessons
 from news_engine import snapshot as news_snapshot
 from trader import run_auto_cycle
@@ -45,6 +45,8 @@ _apply_trading_settings()
 async def lifespan(_app):
     init_db()
     init_learning_db()
+    db = db_status()
+    print(f"[DB] backend={db['backend']} configured={db['configured']} durable={db['durable']} ok={db['ok']}" + (f" error={db['error']}" if db.get('error') else ''))
     _apply_trading_settings()
     if MODE in ('demo','live'):
         try:
@@ -370,15 +372,25 @@ def account():
     from engine import demo_account_state
     return demo_account_state()
 
+@app.get('/api/db-status')
+def database_status():
+    """Safe DB health endpoint; never returns the DATABASE_URL or password."""
+    db = db_status()
+    db['database_url_set'] = bool(os.getenv('DATABASE_URL', '').strip())
+    db['journal_persistent'] = bool(db.get('durable'))
+    if not db.get('durable'):
+        db['warning'] = 'История и обучение не гарантированно переживут перезапуск: нужен рабочий Render Postgres через DATABASE_URL.'
+    return {'ok': bool(db.get('ok')), **db}
+
 @app.get('/api/learning')
 def learning():
     try:
         if MODE in ('demo','live'):
             sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
         report=build_learning_report(1000)
-        report['durable_journal']=bool(os.getenv('DATABASE_URL','').strip())
+        report['durable_journal']=bool(db_status().get('durable'))
         if not report['durable_journal']:
-            report['persistence_warning']='DATABASE_URL не настроен: локальный SQLite на Render не переживает перезапуск сервиса.'
+            report['persistence_warning']='Рабочий durable Postgres не подтверждён. Проверь /api/db-status и DATABASE_URL в Render.'
         return {'ok': True, **report}
     except Exception as e:
         return {'ok': False, 'error': str(e), 'learning_enabled': True}
@@ -389,7 +401,7 @@ def learning_lessons():
         if MODE in ('demo','live'):
             sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
             record_lessons_from_closed(1000)
-        return {'ok': True, 'durable_journal': bool(os.getenv('DATABASE_URL','').strip()), 'lessons': recent_lessons(100)}
+        return {'ok': True, 'durable_journal': bool(db_status().get('durable')), 'lessons': recent_lessons(100)}
     except Exception as e:
         return {'ok': False, 'lessons': [], 'error': str(e)}
 
@@ -399,7 +411,7 @@ def journal():
     try:
         if MODE in ('demo','live'):
             sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
-        return {'ok': True, 'mode': MODE, 'trades': journal_recent(100)}
+        return {'ok': True, 'mode': MODE, 'durable_journal': bool(db_status().get('durable')), 'trades': journal_recent(100)}
     except Exception as e:
         return {'ok': False, 'mode': MODE, 'trades': [], 'error': str(e)}
 
