@@ -377,7 +377,7 @@ def test_bot_deposit_cannot_be_lowered_below_open_stop_risk(monkeypatch, tmp_pat
 
 
 
-def test_manual_risk_and_loss_limits_accept_values_above_5_percent(monkeypatch, tmp_path):
+def test_final_portfolio_policy_overrides_manual_risk_leverage(monkeypatch, tmp_path):
     import journal
     monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'manual_limits.db'))
     import engine, app
@@ -389,7 +389,9 @@ def test_manual_risk_and_loss_limits_accept_values_above_5_percent(monkeypatch, 
     })
     assert r.status_code == 200
     j = r.json()
-    assert j['risk_pct'] == 12.5
+    assert j['risk_pct'] == 10.0
+    assert j['default_leverage'] == 10.0
+    assert j['total_open_risk_pct'] == 10.0
     assert j['daily_loss_limit_usdt'] == 75
     assert j['paper_daily_loss_pct'] == 15
 
@@ -405,9 +407,9 @@ def test_bot_capital_manual_working_and_available_limits(monkeypatch, tmp_path):
     })
     assert r.status_code == 200
     j = r.json()
-    assert j['deposit'] == 10000
-    assert j['working_capital'] == 7000
-    assert j['available_capital_limit'] == 5000
+    assert j['deposit'] == 100.0
+    assert j['working_capital'] == 100.0
+    assert j['available_capital_limit'] == 0.0
 
 
 def test_api_scan_respects_diagnostic_selector(monkeypatch):
@@ -437,9 +439,9 @@ def test_trading_config_api_persists_and_applies(monkeypatch, tmp_path):
     r = c.post('/api/trading-config', json={'max_positions': 6, 'risk_pct': 1.5, 'leverage': 25, 'total_open_risk_pct': 7.5, 'auto_interval_sec': 90, 'daily_loss_limit_usdt': 35, 'paper_daily_loss_pct': 12})
     assert r.status_code == 200
     j = r.json()
-    assert j['max_positions'] == 6 and j['risk_pct'] == 1.5 and j['default_leverage'] == 25 and j['total_open_risk_pct'] == 7.5 and j['auto_interval_sec'] == 90 and j['daily_loss_limit_usdt'] == 35 and j['paper_daily_loss_pct'] == 12
-    assert engine.MAX_POSITIONS == 6 and engine.RISK_PCT_DEFAULT == 1.5 and engine.LEVERAGE == 25 and engine.TOTAL_OPEN_RISK_PCT == 7.5 and engine.DEMO_MAX_DAILY_LOSS == 35 and engine.DAILY_LOSS_LIMIT_PCT == 12
-    assert journal.get_setting('max_positions') == '6' and journal.get_setting('risk_pct') == '1.5'
+    assert j['max_positions'] == 6 and j['risk_pct'] == 10.0 and j['default_leverage'] == 10.0 and j['total_open_risk_pct'] == 10.0 and j['auto_interval_sec'] == 90 and j['daily_loss_limit_usdt'] == 35 and j['paper_daily_loss_pct'] == 12
+    assert engine.MAX_POSITIONS == 6 and engine.RISK_PCT_DEFAULT == 10.0 and engine.LEVERAGE == 10.0 and engine.TOTAL_OPEN_RISK_PCT == 10.0 and engine.DEMO_MAX_DAILY_LOSS == 35 and engine.DAILY_LOSS_LIMIT_PCT == 12
+    assert journal.get_setting('max_positions') == '6' and journal.get_setting('risk_pct') == '10.0'
     engine.MAX_POSITIONS, engine.RISK_PCT_DEFAULT, engine.LEVERAGE, engine.TOTAL_OPEN_RISK_PCT = original
 
 

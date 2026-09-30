@@ -86,3 +86,22 @@ def test_backfill_continues_when_one_historical_row_fails(tmp_path, monkeypatch)
     assert result['failed_rows']==1
     assert result['created_or_updated']==1
     assert result['lesson_total']==1
+
+def test_adaptive_learning_is_bounded_and_needs_samples(monkeypatch, tmp_path):
+    import journal, learning_engine
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(tmp_path/'learn.db'))
+    learning_engine._adaptive_cache={'at':0.0,'rows':[]}
+    learning_engine.init_learning_db()
+    for i in range(10):
+        learning_engine.record_trade_meta({'external_id':f'o{i}','mode':'demo','symbol':'BTCUSDT','side':'LONG','strategy':'normal','score':85,'planned_risk':1,'entry_price':100,'stop_loss':99,'take_profit':102})
+    # Lessons can be written directly for a deterministic unit test of the adaptive layer.
+    with journal._lock, journal._conn() as c:
+        cur=c.cursor()
+        for i in range(10):
+            row=(f'o{i}','demo','BTCUSDT','LONG','normal','WIN',1.0,1.0,85.0,1.0,'lesson','','',float(i+1))
+            if journal._is_pg():
+                cur.execute('INSERT INTO learning_lessons (external_id,mode,symbol,side,strategy,outcome,net_pnl,r_multiple,score,planned_risk,lesson,what_went_right,what_went_wrong,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (external_id) DO NOTHING',row)
+            else:
+                cur.execute('INSERT INTO learning_lessons VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',row)
+    r=learning_engine.adaptive_adjustment('normal','LONG',85)
+    assert r['samples']==10 and -5.0 <= r['adjustment'] <= 5.0 and r['confidence'] > 0
