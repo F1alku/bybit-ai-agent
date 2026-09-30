@@ -457,3 +457,36 @@ def test_paper_auto_uses_persisted_max_positions(monkeypatch):
         assert diag['max_positions'] == 25
     finally:
         engine.MAX_POSITIONS = old
+
+def test_bybit_double_encoded_cursor_is_normalized_once():
+    cursor = 'a201f0d0-1a15-4a4b-9a32-e658b8901033%253A1790762708711218565%252C82933907-bfe8-4b20-bbf0-600505937883%253A1790701353320364902'
+    q = engine._canonical_get_query({'category':'linear','limit':56,'cursor':cursor})
+    assert '%253A' not in q
+    assert '%252C' not in q
+    assert '%3A' in q and '%2C' in q
+
+
+def test_bybit_cursor_query_is_encoded_once():
+    cursor = 'a201f0d0-1a15-4a4b-9a32-e658b8901033%3A1790762708711218565%2C82933907-bfe8-4b20-bbf0-600505937883%3A1790701353320364902'
+    q = engine._canonical_get_query({'category':'linear','limit':56,'cursor':cursor})
+    assert '%253A' not in q
+    assert '%252C' not in q
+    assert '%3A' in q and '%2C' in q
+
+
+def test_private_get_uses_signed_url_exactly(monkeypatch):
+    class Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {'retCode': 0, 'retMsg':'OK', 'result': {'list': []}}
+    calls = []
+    monkeypatch.setattr(engine, 'MODE', 'demo')
+    monkeypatch.setattr(engine, 'DEMO_API_KEY', 'k')
+    monkeypatch.setattr(engine, 'DEMO_API_SECRET', 's')
+    monkeypatch.setattr(engine._http, 'get', lambda *a, **kw: (calls.append((a,kw)) or Resp()))
+    params = {'category':'linear','limit':56,'cursor':'abc%3A123%2Cxyz'}
+    engine.bybit_private_get('/v5/position/closed-pnl', params, retries=0)
+    url = calls[0][0][0]
+    assert '%253A' not in url and '%252C' not in url
+    assert 'cursor=abc%3A123%2Cxyz' in url
+    assert calls[0][1].get('params') is None
