@@ -60,3 +60,29 @@ def test_closed_trade_without_context_still_becomes_lesson(tmp_path, monkeypatch
     assert result['created_or_updated']==1
     assert result['unmatched_context']==1
     assert learning_engine.recent_lessons()[0]['context_found'] if 'context_found' in learning_engine.recent_lessons()[0] else True
+
+
+def test_backfill_continues_when_one_historical_row_fails(tmp_path, monkeypatch):
+    import journal, learning_engine
+    db=tmp_path/'partial.db'
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(db))
+    monkeypatch.setattr(learning_engine, '_conn', journal._conn)
+    monkeypatch.setattr(learning_engine, '_lock', journal._lock)
+    monkeypatch.setattr(learning_engine, 'recent', journal.recent)
+    monkeypatch.setattr(learning_engine, 'aliases_for_orders', journal.aliases_for_orders)
+    journal.init_db()
+    journal.upsert_closed_pnl('demo', {'execId':'BAD','symbol':'BTCUSDT','side':'Buy','qty':'1','avgEntryPrice':'100','avgExitPrice':'101','closedPnl':'1','createdTime':'1','updatedTime':'1'})
+    journal.upsert_closed_pnl('demo', {'execId':'GOOD','symbol':'ETHUSDT','side':'Sell','qty':'1','avgEntryPrice':'100','avgExitPrice':'99','closedPnl':'1','createdTime':'2','updatedTime':'2'})
+    original=learning_engine._match_meta
+    calls={'n':0}
+    def flaky(*args, **kwargs):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise ValueError('synthetic malformed row')
+        return original(*args, **kwargs)
+    monkeypatch.setattr(learning_engine, '_match_meta', flaky)
+    result=learning_engine.record_lessons_from_closed()
+    assert result['closed_rows']==2
+    assert result['failed_rows']==1
+    assert result['created_or_updated']==1
+    assert result['lesson_total']==1
