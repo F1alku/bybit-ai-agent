@@ -492,3 +492,29 @@ def test_private_get_uses_signed_url_exactly(monkeypatch):
     assert '%253A' not in url and '%252C' not in url
     assert 'cursor=abc%3A123%2Cxyz' in url
     assert calls[0][1].get('params') is None
+
+def test_demo_open_retries_qty_invalid_after_refresh(monkeypatch):
+    import engine
+    monkeypatch.setattr(engine, "MODE", "demo")
+    calls = []
+    rules = [
+        [{"symbol":"MOVRUSDT","lotSizeFilter":{"qtyStep":"0.1","minOrderQty":"0.1","maxMktOrderQty":"100"}}],
+        [{"symbol":"MOVRUSDT","lotSizeFilter":{"qtyStep":"0.1","minOrderQty":"0.1","maxMktOrderQty":"100"}}],
+    ]
+    monkeypatch.setattr(engine, "instruments", lambda: rules[min(len(calls), 1)])
+    monkeypatch.setattr(engine, "_demo_available_usdt", lambda: (100.0, 100.0, {}))
+    monkeypatch.setattr(engine, "_demo_positions", lambda: [])
+    monkeypatch.setattr(engine, "_demo_guard_status", lambda equity: (0.0, False))
+    monkeypatch.setattr(engine, "_effective_leverage", lambda symbol, requested=None: (10.0, {'min_notional':0.0,'min_leverage':1.0,'max_leverage':100.0,'leverage_step':0.01,'tick_size':0.01}))
+    def fake_post(path, body, allow_ret_codes=None):
+        if path.endswith('set-leverage'):
+            return {}
+        calls.append(body['qty'])
+        if len(calls) == 1:
+            raise RuntimeError('Bybit 10001: Qty invalid')
+        return {'orderId':'OID-1'}
+    monkeypatch.setattr(engine, "bybit_private_post", fake_post)
+    monkeypatch.setattr(engine, "_invalidate_demo_account_cache", lambda: None)
+    result = engine.demo_open({'symbol':'MOVRUSDT','side':'LONG','entry':10.0,'stop_loss':9.0,'take_profit':12.0,'risk_pct':10,'leverage':10,'capital_allocation_pct':50})
+    assert result['ok'] is True
+    assert calls == ['10', '10']
