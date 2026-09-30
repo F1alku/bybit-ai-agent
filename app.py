@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from engine import market_snapshot, scan_market, paper_state, paper_open, paper_reset, paper_mark_to_market, set_paper_budget, MODE, demo_state, demo_open, close_position, trade_monitor_snapshot, bot_capital_config, set_bot_capital
-from journal import init_db, recent as journal_recent, sync_closed_pnl, get_setting, set_setting, db_status
+from journal import init_db, recent as journal_recent, sync_closed_pnl, sync_closed_pnl_detailed, get_setting, set_setting, db_status
 from learning_engine import build_learning_report, init_learning_db, record_lessons_from_closed, recent_lessons
 from news_engine import snapshot as news_snapshot
 from trader import run_auto_cycle
@@ -50,7 +50,7 @@ async def lifespan(_app):
     _apply_trading_settings()
     if MODE in ('demo','live'):
         try:
-            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
+            sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
             record_lessons_from_closed(1000)
         except Exception:
             pass
@@ -72,7 +72,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.10', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.12', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -399,7 +399,7 @@ def learning():
 def learning_lessons():
     try:
         if MODE in ('demo','live'):
-            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
+            sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
             record_lessons_from_closed(1000)
         return {'ok': True, 'durable_journal': bool(db_status().get('durable')), 'lessons': recent_lessons(100)}
     except Exception as e:
@@ -409,9 +409,18 @@ def learning_lessons():
 @app.get('/api/journal')
 def journal():
     try:
+        sync = {'synced': 0, 'exchange_closed_count': 0, 'errors': []}
         if MODE in ('demo','live'):
-            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
-        return {'ok': True, 'mode': MODE, 'durable_journal': bool(db_status().get('durable')), 'trades': journal_recent(100)}
+            sync = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
+        db = db_status()
+        trades = journal_recent(100)
+        return {
+            'ok': True, 'mode': MODE, 'durable_journal': bool(db.get('durable')),
+            'db_backend': db.get('backend'), 'db_error': db.get('error'),
+            'exchange_closed_count': sync.get('exchange_closed_count', 0),
+            'synced_count': sync.get('synced', 0), 'sync_errors': sync.get('errors', []),
+            'db_trade_count': len(trades), 'trades': trades
+        }
     except Exception as e:
         return {'ok': False, 'mode': MODE, 'trades': [], 'error': str(e)}
 

@@ -220,7 +220,7 @@ The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-mar
 - `/api/journal` and `/api/learning/lessons` report whether the current journal is durable.
 
 
-## v6.1.11 — Adaptive Position Exit
+## v6.1.12 — Adaptive Position Exit
 - The configured risk percentage is a maximum planned loss, not a mandatory hold threshold.
 - Every AUTO cycle now re-evaluates open Demo/Live positions before looking for new entries.
 - The exit layer checks 5M/15M/1H direction, momentum, EMA20 alignment and confirmed high-impact news.
@@ -232,7 +232,7 @@ The included `render.yaml` is configured for Demo mode, NORMAL + SCALP, full-mar
 - The Trade Monitor UI now shows HOLD / TRAIL / REASSESS / EXIT and the reasons/signals behind the decision.
 
 
-## v6.1.11 Trade Thesis
+## v6.1.12 Trade Thesis
 - Each open trade is evaluated as a testable thesis: why it was good, what confirms it now, and what invalidates it.
 - Initial/latest thesis is stored in the durable DB.
 - UI shows thesis health 0-100 plus reasons to continue and reasons to exit.

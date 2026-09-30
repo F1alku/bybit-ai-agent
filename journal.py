@@ -155,16 +155,23 @@ def upsert_closed_pnl(mode, item):
                     (order_id, order_link_id, str(item.get('symbol') or ''), int(item.get('createdTime') or 0), int(item.get('updatedTime') or 0)))
 
 
-def sync_closed_pnl(mode, items):
+def sync_closed_pnl_detailed(mode, items):
     init_db()
     count = 0
+    errors = []
+    total = len(items or [])
     for item in items or []:
         try:
             upsert_closed_pnl(mode, item)
             count += 1
-        except Exception:
-            continue
-    return count
+        except Exception as e:
+            if len(errors) < 5:
+                errors.append(str(e))
+    return {'synced': count, 'exchange_closed_count': total, 'errors': errors}
+
+
+def sync_closed_pnl(mode, items):
+    return sync_closed_pnl_detailed(mode, items).get('synced', 0)
 
 
 def aliases_for_orders(order_ids):

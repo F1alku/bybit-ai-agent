@@ -1168,8 +1168,13 @@ def demo_open(d):
     _invalidate_demo_account_cache()
     try:
         from learning_engine import record_trade_meta
+        _result_order_id = ((result or {}).get('orderId') if isinstance(result, dict) else None)
         record_trade_meta({
-            'external_id': order.get('orderLinkId') or order.get('orderId'), 'order_id': order.get('orderId'), 'order_link_id': order.get('orderLinkId'), 'mode': MODE, 'symbol': symbol, 'side': side,
+            # Prefer the real Bybit orderId returned by /v5/order/create.
+            # The closed-PnL endpoint is keyed by Bybit execution/order identifiers,
+            # so using only our client orderLinkId can leave the lesson orphaned.
+            'external_id': _result_order_id or order.get('orderLinkId') or order.get('orderId'),
+            'order_id': _result_order_id or order.get('orderId'), 'order_link_id': order.get('orderLinkId'), 'mode': MODE, 'symbol': symbol, 'side': side,
             'strategy': d.get('strategy'), 'score': d.get('score'), 'risk_pct': d.get('risk_pct'),
             'leverage': leverage, 'atr_pct': d.get('atr_pct'), 'market_regime': d.get('market_regime'),
             'entry_timing': d.get('entry_timing'), 'news_impact': d.get('news_impact'),
@@ -1426,7 +1431,17 @@ def close_position(symbol):
         'orderLinkId':f'ai-close-{int(time.time()*1000)}'
     })
     _invalidate_demo_account_cache()
-    return {'mode':MODE,'ok':True,'symbol':symbol,'closed_qty':qty,'order':result}
+    # Bybit may publish the closed-PnL record a moment after the reduce-only
+    # order is accepted. Pull it immediately so History does not depend on a
+    # later browser refresh or a Render request.
+    sync_info = {'synced': 0, 'error': None}
+    try:
+        time.sleep(0.6)
+        from journal import sync_closed_pnl_detailed
+        sync_info = sync_closed_pnl_detailed(MODE, _demo_closed_pnl(100))
+    except Exception as e:
+        sync_info['error'] = str(e)
+    return {'mode':MODE,'ok':True,'symbol':symbol,'closed_qty':qty,'order':result,'history_sync':sync_info}
 
 def demo_state():
     global _demo_last_good_state
