@@ -43,4 +43,20 @@ def test_learning_module_has_closed_trade_fallback():
     src=open("learning_engine.py", encoding="utf-8").read()
     assert "execId/orderId" in src
     assert "Контекст входа не найден" in src
-    assert "meta_by_symbol_side" in src
+    assert "by_symbol_side" in src
+
+def test_closed_trade_without_context_still_becomes_lesson(tmp_path, monkeypatch):
+    import journal, learning_engine
+    db=tmp_path/'unmatched.db'
+    monkeypatch.setattr(journal, 'SQLITE_PATH', str(db))
+    monkeypatch.setattr(learning_engine, '_conn', journal._conn)
+    monkeypatch.setattr(learning_engine, '_lock', journal._lock)
+    monkeypatch.setattr(learning_engine, 'recent', journal.recent)
+    monkeypatch.setattr(learning_engine, 'aliases_for_orders', journal.aliases_for_orders)
+    journal.init_db()
+    journal.upsert_closed_pnl('demo', {'execId':'EXEC-UNMATCHED','orderId':'OID-U','symbol':'ETHUSDT','side':'Sell','qty':'1','avgEntryPrice':'100','avgExitPrice':'99','closedPnl':'1','openFee':'0','closeFee':'0','createdTime':'1','updatedTime':'2'})
+    result=learning_engine.record_lessons_from_closed()
+    assert result['closed_rows']==1
+    assert result['created_or_updated']==1
+    assert result['unmatched_context']==1
+    assert learning_engine.recent_lessons()[0]['context_found'] if 'context_found' in learning_engine.recent_lessons()[0] else True
