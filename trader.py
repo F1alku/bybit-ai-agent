@@ -2,6 +2,25 @@ import os, time
 from engine import MODE, MAX_POSITIONS, scan_market, demo_state, demo_open, paper_state, paper_open, paper_mark_to_market, manage_open_positions
 from capital_allocator import allocate, validate_allocations, RISK_PER_TRADE_PCT, MAX_NEW_ENTRIES
 
+# Contracts that Bybit has explicitly marked as requiring an agreement are
+# temporarily excluded from AUTO. The TTL lets them become eligible again if
+# the account agreement is later completed.
+_UNAVAILABLE_SYMBOLS = {}
+AGREEMENT_SKIP_TTL_SEC = float(os.getenv('AGREEMENT_SKIP_TTL_SEC', '21600'))
+
+def _is_agreement_required_error(error):
+    return '110126' in str(error or '')
+
+def _mark_symbol_unavailable(symbol, reason):
+    _UNAVAILABLE_SYMBOLS[str(symbol).upper()] = {'until': time.time() + AGREEMENT_SKIP_TTL_SEC, 'reason': str(reason)}
+
+def _unavailable_symbols():
+    now = time.time()
+    expired = [s for s,v in _UNAVAILABLE_SYMBOLS.items() if float(v.get('until',0)) <= now]
+    for s in expired:
+        _UNAVAILABLE_SYMBOLS.pop(s, None)
+    return set(_UNAVAILABLE_SYMBOLS)
+
 STRATEGY_DEFAULT = os.getenv('STRATEGY_MODE','both').lower() if os.getenv('STRATEGY_MODE','both').lower() in ('normal','scalp','both') else 'both'
 
 def _strategy_config():
@@ -80,6 +99,8 @@ def run_auto_cycle():
                     candidate_stats[m]['openable'] += 1
                     y=dict(x); y['strategy']=m; candidates.append(y)
         # Same symbol is one position in one-way mode; keep the stronger score.
+        blocked_symbols = _unavailable_symbols()
+        candidates = [x for x in candidates if str(x.get('symbol','')).upper() not in blocked_symbols]
         best={}
         for x in candidates:
             key=x['symbol'];
@@ -99,7 +120,10 @@ def run_auto_cycle():
             try:
                 demo_open({'symbol':x['symbol'],'side':x['direction'],'entry':x['price'],'stop_loss':x['stop_loss'],'take_profit':x['take_profit'],'risk_pct':min(10.0,float(a.get('risk_pct_of_bot') or risk_pct)),'leverage':10.0,'capital_allocation_pct':a.get('capital_pct'),'strategy':x.get('strategy'),'score':x.get('score'),'atr_pct':x.get('atr_pct'),'market_regime':x.get('market_regime'),'entry_timing':x.get('entry_timing'),'news_impact':x.get('news_impact')})
                 opened.append(f"{x['strategy'].upper()} {x['direction']} {x['symbol']} {x['score']}/100 • cap {a.get('capital_pct',0):.1f}% • risk {a.get('risk_pct_of_bot',0):.2f}%"); used += 1
-            except (ValueError, RuntimeError) as e: rejected.append(f"{x.get('strategy','?').upper()} {x['symbol']}: {e}")
+            except (ValueError, RuntimeError) as e:
+                if _is_agreement_required_error(e):
+                    _mark_symbol_unavailable(x['symbol'], e)
+                rejected.append(f"{x.get('strategy','?').upper()} {x['symbol']}: {e}")
             except Exception as e: rejected.append(f"{x.get('strategy','?').upper()} {x['symbol']}: unexpected execution error: {e}")
         result = scans[modes[0]] if len(modes)==1 else {'ok':True,'mode':MODE,'strategy':'both','scans':scans,'results':sum([r.get('results',[]) for r in scans.values()],[])}
         prefix='AUTO LIVE' if MODE=='live' else 'AUTO DEMO'
@@ -119,6 +143,7 @@ def run_auto_cycle():
             'leverage_target':10.0,
             'allocation':allocated,
             'allocation_check':allocation_check,
+            'temporarily_unavailable_symbols': sorted(_unavailable_symbols()),
         }
         return result, action, diagnostics
 

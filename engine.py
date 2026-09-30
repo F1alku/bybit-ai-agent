@@ -1,4 +1,5 @@
 import math
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,7 +77,7 @@ PAPER_SLIPPAGE_RATE = 0.0002
 _lock = threading.RLock()
 _rest_rate_lock = threading.Lock()
 _rest_last_request = 0.0
-_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/6.0.0'}, limits=httpx.Limits(max_connections=40, max_keepalive_connections=20))
+_http = httpx.Client(timeout=TIMEOUT, headers={'User-Agent': 'BybitAI-Agent/6.2.2'}, limits=httpx.Limits(max_connections=40, max_keepalive_connections=20))
 _cache = {}
 _state = {
     'balance': START_BALANCE,
@@ -1230,12 +1231,36 @@ def demo_open(d):
         {'category':'linear','symbol':symbol,'buyLeverage':str(leverage),'sellLeverage':str(leverage)},
         allow_ret_codes={110043},
     )
+    qty_text = _format_qty(symbol, qty)
+    qty = float(qty_text)
     order = {
-        'category':'linear','symbol':symbol,'side':'Buy' if side == 'LONG' else 'Sell','orderType':'Market','qty':str(qty),
+        'category':'linear','symbol':symbol,'side':'Buy' if side == 'LONG' else 'Sell','orderType':'Market','qty':qty_text,
         'positionIdx':0,'reduceOnly':False,'takeProfit':str(tp),'stopLoss':str(sl),
         'tpTriggerBy':'MarkPrice','slTriggerBy':'MarkPrice','orderLinkId':f'ai-{int(time.time()*1000)}'
     }
-    result = bybit_private_post('/v5/order/create', order)
+    try:
+        result = bybit_private_post('/v5/order/create', order)
+    except RuntimeError as exc:
+        # 10001 is safe to retry once because the order was rejected, not accepted.
+        # Refresh instrument metadata in case qtyStep/min/max changed on Bybit.
+        if _bybit_ret_code(exc) != 10001:
+            raise
+        _invalidate_instruments_cache()
+        qty, margin, available, equity, cap, leverage, constraints, actual_risk = _demo_risk_qty(
+            symbol, entry, sl, d.get('leverage'), d.get('risk_pct'), return_details=True,
+            capital_allocation_pct=d.get('capital_allocation_pct'))
+        qty_text = _format_qty(symbol, qty)
+        qty = float(qty_text)
+        order['qty'] = qty_text
+        try:
+            result = bybit_private_post('/v5/order/create', order)
+        except RuntimeError as retry_exc:
+            if _bybit_ret_code(retry_exc) == 10001:
+                step, min_qty, max_qty = _symbol_rules(symbol)
+                raise RuntimeError(
+                    f'Bybit 10001: Qty invalid | {symbol} qty={qty_text} qtyStep={step:g} minOrderQty={min_qty:g} maxMarketQty={max_qty:g}'
+                ) from retry_exc
+            raise
     _invalidate_demo_account_cache()
     try:
         from learning_engine import record_trade_meta
@@ -1826,8 +1851,52 @@ def paper_state():
 
 
 def _round_step(value, step):
-    if not step or step <= 0: return value
-    return math.floor(value / step) * step
+    """Round a quantity down using Decimal so Bybit never receives float artifacts."""
+    if not step or step <= 0:
+        return float(value)
+    try:
+        v = Decimal(str(value))
+        st = Decimal(str(step))
+        if st <= 0:
+            return float(value)
+        return float((v / st).to_integral_value(rounding=ROUND_DOWN) * st)
+    except (InvalidOperation, ValueError, TypeError):
+        return math.floor(float(value) / float(step)) * float(step)
+
+def _format_qty(symbol, qty, *, enforce_min=True):
+    """Return an exchange-safe quantity string using the live instrument rules.
+
+    Bybit rejects quantities that contain binary-float residue or exceed the market
+    order cap even when the mathematical value appears valid. Canonicalise with
+    Decimal, clamp to maxMktOrderQty/maxOrderQty, then round down to qtyStep.
+    """
+    step, min_qty, max_qty = _symbol_rules(symbol)
+    try:
+        q = Decimal(str(qty))
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError(f'invalid quantity for {symbol}: {qty!r}')
+    if q <= 0:
+        raise ValueError(f'quantity must be positive for {symbol}')
+    if max_qty > 0:
+        q = min(q, Decimal(str(max_qty)))
+    if step > 0:
+        st = Decimal(str(step))
+        q = (q / st).to_integral_value(rounding=ROUND_DOWN) * st
+    if q <= 0 or (enforce_min and min_qty > 0 and q < Decimal(str(min_qty))):
+        raise ValueError(f'quantity {q:g} is below Bybit minimum {min_qty:g} for {symbol}')
+    # Fixed-point output avoids scientific notation and float tails.
+    text = format(q, 'f')
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    return text or '0'
+
+def _invalidate_instruments_cache():
+    _cache.pop(('__instruments__',), None)
+
+def _bybit_ret_code(error):
+    import re
+    m = re.search(r'Bybit\s+(\d+):', str(error or ''))
+    return int(m.group(1)) if m else None
 
 def _symbol_rules(symbol):
     try:
