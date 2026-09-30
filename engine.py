@@ -1022,10 +1022,23 @@ def _demo_positions():
     return _private_put(key, bybit_private_get('/v5/position/list', {'category':'linear','settleCoin':'USDT'}).get('list', []))
 
 def _demo_closed_pnl(limit=100):
-    key = ('closed_pnl', min(int(limit), 100))
-    cached = _private_cached(key, DEMO_CLOSED_PNL_CACHE_TTL)
+    # Reconcile the complete requested window, not just the first page.
+    # This matters for overnight runs and for backfilling existing trades.
+    requested=max(1, min(int(limit), 500))
+    key=('closed_pnl', requested)
+    cached=_private_cached(key, DEMO_CLOSED_PNL_CACHE_TTL)
     if cached is not None: return cached
-    return _private_put(key, bybit_private_get('/v5/position/closed-pnl', {'category':'linear','limit':min(int(limit), 100)}).get('list', []))
+    items=[]; cursor=None
+    while len(items) < requested:
+        params={'category':'linear','limit':min(200, requested-len(items))}
+        if cursor: params['cursor']=cursor
+        result=bybit_private_get('/v5/position/closed-pnl', params)
+        page=result.get('list') or []
+        items.extend(page)
+        next_cursor=str(result.get('nextPageCursor') or '')
+        if not page or not next_cursor or next_cursor == cursor: break
+        cursor=next_cursor
+    return _private_put(key, items[:requested])
 
 def _invalidate_demo_account_cache():
     with _private_cache_lock:
@@ -1323,8 +1336,35 @@ def _position_exit_analysis(p):
     except Exception as e:
         base['thesis_error']=str(e)[:180]; return base
 
-def _partial_take_profit_key(p):
-    return f"partial_tp_10:{p.get('symbol')}:{p.get('side')}:{p.get('avgPrice')}"
+# Fixed profit-protection ladder for already-open positions.
+# Thresholds are P&L as a percentage of occupied margin. Each stage realizes
+# 10% of the ORIGINAL position size, so the ladder is predictable and does
+# not shrink its own percentages after every partial close. The remaining
+# runner is managed by Adaptive Exit / Liquidity Intelligence.
+PROFIT_LADDER = (
+    (10.0, 0.10, 0.0),
+    (20.0, 0.10, 10.0),
+    (30.0, 0.10, 20.0),
+    (40.0, 0.10, 30.0),
+    (50.0, 0.10, 40.0),
+)
+
+def _profit_ladder_key(p, stage):
+    return f"profit_ladder:{stage}:{p.get('symbol')}:{p.get('side')}:{p.get('avgPrice')}"
+
+def _profit_ladder_initial_qty_key(p):
+    return f"profit_ladder_initial:{p.get('symbol')}:{p.get('side')}:{p.get('avgPrice')}"
+
+def _profit_ladder_crossed(pnl_pct):
+    return [stage for stage, fraction, lock_pct in PROFIT_LADDER if pnl_pct >= stage]
+
+def _profit_lock_price(entry, qty, margin, side, lock_pct):
+    # Approximate the price corresponding to a P&L-on-margin percentage.
+    # P&L ~= qty * price_delta, so delta = margin * pct / qty.
+    if qty <= 0 or margin <= 0:
+        return entry
+    delta = (margin * (lock_pct / 100.0)) / qty
+    return entry + delta if side == 'Buy' else entry - delta
 
 def manage_open_positions():
     """Actively manage open Demo/Live positions.
@@ -1366,43 +1406,82 @@ def manage_open_positions():
                 _invalidate_demo_account_cache()
                 continue
 
-            # Profit protection: once +10% on occupied margin is reached, take
-            # the existing 10% partial and then move the hard SL to breakeven if
-            # the thesis is still aligned. This is independent of entry risk_pct.
+            # Fixed profit ladder. Thresholds are +10/+20/+30/+40/+50% P&L
+            # on occupied margin. At every crossed stage we realize 10% of the
+            # original position size and progressively raise the hard SL on the
+            # remaining runner. This protects realized profit while allowing the
+            # thesis/liquidity engine to keep the runner alive.
             pnl_pct=(upnl/max(margin,1e-9))*100
-            if pnl_pct < 10.0:
-                continue
-            key=_partial_take_profit_key(p)
-            if get_setting(key, '0') == '1':
+            if pnl_pct < PROFIT_LADDER[0][0]:
                 continue
             symbol=str(p.get('symbol')); side=str(p.get('side'))
-            qty_step,min_qty,_max_qty=_symbol_rules(symbol)
-            partial=size*0.10
+            initial_key=_profit_ladder_initial_qty_key(p)
+            try:
+                initial_qty=float(get_setting(initial_key, '0') or 0)
+            except Exception:
+                initial_qty=0.0
+            if initial_qty <= 0:
+                initial_qty=size
+                set_setting(initial_key, str(initial_qty))
+
+            crossed=[]
+            for stage, fraction, lock_pct in PROFIT_LADDER:
+                if pnl_pct >= stage and get_setting(_profit_ladder_key(p, stage), '0') != '1':
+                    crossed.append((stage, fraction, lock_pct))
+            if not crossed:
+                continue
+
+            qty_step,min_qty,max_qty=_symbol_rules(symbol)
+            total_fraction=sum(x[1] for x in crossed)
+            partial=initial_qty*total_fraction
+            if max_qty>0: partial=min(partial,max_qty)
             if qty_step>0: partial=_round_step(partial,qty_step)
             if min_qty>0 and partial<min_qty: partial=min_qty
-            if partial<=0 or partial>size: continue
+            if partial<=0 or partial>size:
+                actions.append({'symbol':symbol,'action':'PROFIT_LADDER_SKIPPED','pnl_on_margin_pct':round(pnl_pct,3),'stages':[x[0] for x in crossed],'reason':'calculated partial quantity is invalid for current exchange size/step'})
+                continue
+
             close_side='Sell' if side=='Buy' else 'Buy'
             order=bybit_private_post('/v5/order/create',{
                 'category':'linear','symbol':symbol,'side':close_side,'orderType':'Market','qty':str(partial),
                 'positionIdx':int(p.get('positionIdx') or 0),'reduceOnly':True,'closeOnTrigger':True,
-                'orderLinkId':f'ai-partial10-{int(time.time()*1000)}'
+                'orderLinkId':f'ai-profit-ladder-{int(time.time()*1000)}'
             })
-            set_setting(key,'1')
-            action={'symbol':symbol,'action':'PARTIAL_TP_10','closed_qty':partial,'position_qty':size,'pnl_on_margin_pct':round(pnl_pct,3),'order':order,'analysis':analysis}
-            if analysis.get('decision')=='HOLD / TRAIL':
-                current_sl=float(p.get('stopLoss') or 0)
-                improve=(side=='Buy' and (current_sl<=0 or current_sl<entry)) or (side=='Sell' and (current_sl<=0 or current_sl>entry))
-                if improve:
+            for stage, fraction, lock_pct in crossed:
+                set_setting(_profit_ladder_key(p, stage),'1')
+
+            # Move the exchange hard SL to the last lock level below the current
+            # stage. At +10% we lock breakeven; at +20% we lock approximately +10%,
+            # etc. Never worsen an existing SL.
+            highest_lock=max(x[2] for x in crossed)
+            target_sl=_profit_lock_price(entry, size, margin, side, highest_lock)
+            current_sl=float(p.get('stopLoss') or 0)
+            improve=(side=='Buy' and (current_sl<=0 or target_sl>current_sl)) or (side=='Sell' and (current_sl<=0 or target_sl<current_sl))
+            sl_changed=False
+            if improve and target_sl>0:
+                try:
                     bybit_private_post('/v5/position/trading-stop',{
                         'category':'linear','symbol':symbol,'positionIdx':int(p.get('positionIdx') or 0),
-                        'stopLoss':str(entry),'slTriggerBy':'MarkPrice'
+                        'stopLoss':str(target_sl),'slTriggerBy':'MarkPrice'
                     })
-                    action['remainder']='HOLD/TRAIL; SL moved to breakeven'
-                else:
-                    action['remainder']='HOLD/TRAIL'
+                    sl_changed=True
+                except Exception as sl_err:
+                    sl_error=str(sl_err)[:180]
             else:
-                action['remainder']='REASSESS'
+                sl_error=None
+
+            action={
+                'symbol':symbol,'action':'PROFIT_LADDER',
+                'stages':[{'threshold_pct':x[0],'fraction_of_original':x[1],'lock_profit_pct':x[2]} for x in crossed],
+                'closed_qty':partial,'original_position_qty':initial_qty,
+                'remaining_position_qty_estimate':max(0.0,size-partial),
+                'pnl_on_margin_pct':round(pnl_pct,3),'order':order,
+                'sl_locked_to_profit_pct':highest_lock,'sl_price':target_sl if sl_changed else current_sl,
+                'sl_changed':sl_changed,'sl_error':sl_error,
+                'analysis':analysis
+            }
             actions.append(action)
+            _invalidate_demo_account_cache()
             _invalidate_demo_account_cache()
         except Exception as e:
             actions.append({'symbol':p.get('symbol'),'action':'MANAGEMENT_ERROR','error':str(e)})
@@ -1430,7 +1509,8 @@ def trade_monitor_snapshot():
             'stop_loss':float(p.get('stopLoss') or 0),'take_profit':float(p.get('takeProfit') or 0),
             'unrealised_pnl':upnl,'pnl_on_margin_pct':round((upnl/max(margin,1e-9))*100,3) if margin else 0,
             **a,
-            'partial_take_profit_threshold_pct':10.0,'partial_take_profit_fraction':0.10,
+            'profit_ladder': [{'threshold_pct':x[0],'fraction_of_original':x[1],'lock_profit_pct':x[2]} for x in PROFIT_LADDER],
+            'profit_ladder_note':'At each +10% P&L-on-margin stage, 10% of the original position is realized; the hard SL is progressively moved to protect the runner.',
             'hard_stop_note':'Hard SL remains active; adaptive EXIT can close earlier when the thesis is invalidated.'
         })
     return {'ok':True,'mode':MODE,'positions':out,'checked_at':int(time.time()*1000)}

@@ -1,3 +1,12 @@
+# v6.1.23 — Full History + Learning Backfill + Profit Ladder
+
+- Fixed staged profit-taking for open positions only.
+- Thresholds: +10/+20/+30/+40/+50% P&L relative to occupied margin.
+- Each stage realizes 10% of the original position size.
+- Exchange hard SL is progressively moved: breakeven, then approximately +10/+20/+30/+40% margin-P&L equivalent.
+- Adaptive Exit and Liquidity Intelligence remain responsible for the remaining runner.
+- No automatic re-entry is forced after a partial take-profit; a new entry requires a fresh setup.
+
 # v6.1.21 — Learning Sync Fix
 
 Fixes learning from Bybit Closed PnL: execId/orderId mismatches now use symbol/side/entry-price fallback. Closed trades without saved entry context still create outcome lessons instead of disappearing.
@@ -19,3 +28,12 @@ History remains PostgreSQL-backed and Liquidity Intelligence remains restricted 
 
 - v6.1.20 fixes PostgreSQL psycopg row conversion in journal history and separates history-sync errors from learning errors.
 - UI version labels are unified to 6.1.20.
+
+
+## v6.1.23 changes
+- Full Bybit Closed PnL pagination for reconciliation (up to 500 rows per sync).
+- Existing closed trades are backfilled into `learning_lessons`; missing entry context never blocks a lesson.
+- Learning reconciliation reports closed rows, matched context, unmatched context and match method.
+- Order ID / orderLinkId aliases are resolved in both directions.
+- History UI shows exchange count, DB count, learning count and context coverage.
+- Keeps the v6.1.22 fixed profit ladder and hard-stop protection.

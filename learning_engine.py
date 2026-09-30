@@ -129,70 +129,98 @@ def _group(rows, key):
     return {str(k):_stats(v) for k,v in groups.items()}
 
 
-def record_lessons_from_closed(limit=1000):
-    """Persist an explainable post-trade lesson for each closed trade."""
-    init_learning_db()
-    rows = _closed_rows(limit)
+def _load_meta_indexes():
+    """Load entry context plus secondary indexes used to reconcile Bybit ids (execId/orderId/orderLinkId)."""
     with _lock, _conn() as c:
         cur = c.cursor()
-        cur.execute('SELECT external_id,mode,symbol,side,strategy,score,risk_pct,planned_risk,market_regime,entry_timing,news_impact FROM learning_trade_meta')
-        cols = ['external_id','mode','symbol','side','strategy','score','risk_pct','planned_risk','market_regime','entry_timing','news_impact']
-        meta = {str(r[0]): dict(zip(cols, r)) for r in cur.fetchall()}
+        cur.execute('SELECT external_id,mode,symbol,side,strategy,score,risk_pct,planned_risk,market_regime,entry_timing,news_impact,entry_price,captured_at FROM learning_trade_meta')
+        cols = ['external_id','mode','symbol','side','strategy','score','risk_pct','planned_risk','market_regime','entry_timing','news_impact','entry_price','captured_at']
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    meta = {str(r['external_id']): r for r in rows}
+    by_symbol_side = {}
+    for m in rows:
+        by_symbol_side.setdefault((str(m.get('symbol') or '').upper(), str(m.get('side') or '').upper()), []).append(m)
+    return meta, by_symbol_side
+
+
+def _match_meta(r, meta, by_symbol_side, aliases):
+    key = str(r.get('external_id') or '')
+    if key in meta:
+        return meta[key], 'external_id'
+    alias = aliases.get(key)
+    if alias and str(alias) in meta:
+        return meta[str(alias)], 'alias'
+    symbol = str(r.get('symbol') or '').upper()
+    side = str(r.get('side') or '').upper()
+    candidates = list(by_symbol_side.get((symbol, side), []))
+    ep = float(r.get('entry_price') or 0)
+    if ep:
+        close = [m for m in candidates if abs(float(m.get('entry_price') or 0)-ep) <= max(abs(ep)*1e-6, 1e-12)]
+        if close:
+            candidates = close
+    if candidates:
+        # Prefer the closest entry price, then latest captured context.
+        candidates.sort(key=lambda m: (abs(float(m.get('entry_price') or 0)-ep) if ep else 0, -float(m.get('captured_at') or 0)))
+        return candidates[0], 'symbol_side_entry_price' if ep else 'symbol_side'
+    return None, 'none'
+
+
+def record_lessons_from_closed(limit=1000):
+    """Backfill every closed journal row into learning_lessons.
+
+    A missing entry context must NEVER prevent a closed trade from becoming a
+    lesson. Context is an enhancement, not a prerequisite for learning.
+    """
+    init_learning_db()
+    rows = _closed_rows(limit)
+    meta, by_symbol_side = _load_meta_indexes()
     aliases = aliases_for_orders([r.get('external_id') for r in rows])
-    # Build secondary indexes because Bybit Closed PnL may use execId/orderId
-    # different from the orderId captured at entry.
-    meta_by_symbol_side = {}
-    for mk, mv in meta.items():
-        meta_by_symbol_side.setdefault((str(mv.get('symbol') or ''), str(mv.get('side') or '').upper()), []).append((mk, mv))
     lessons=[]
+    matched=0
+    unmatched=0
+    match_methods={}
     for r in rows:
-        key=str(r['external_id']); m=meta.get(key)
-        if not m and aliases.get(key): m=meta.get(str(aliases[key]))
-        # Fallback: match the most recent entry context for the same symbol/side
-        # and (when available) entry price. This covers execId-vs-orderId drift.
-        if not m:
-            candidates = meta_by_symbol_side.get((str(r.get('symbol') or ''), str(r.get('side') or '').upper()), [])
-            ep=float(r.get('entry_price') or 0)
-            if ep:
-                close=[(mk,mv) for mk,mv in candidates if abs(float(mv.get('entry_price') or 0)-ep) <= max(abs(ep)*1e-6, 1e-12)]
-                if close: candidates=close
-            if candidates:
-                m=max(candidates, key=lambda x: float(x[1].get('captured_at') or 0))[1]
-        net=float(r.get('net_pnl') or 0); planned=float(m.get('planned_risk') or 0) if m else 0
+        key=str(r.get('external_id') or '')
+        m, match_method = _match_meta(r, meta, by_symbol_side, aliases)
+        if m: matched += 1
+        else: unmatched += 1
+        match_methods[match_method] = match_methods.get(match_method, 0) + 1
+        net=float(r.get('net_pnl') or 0)
+        planned=float(m.get('planned_risk') or 0) if m else 0
         outcome='WIN' if net>0 else 'LOSS' if net<0 else 'BREAKEVEN'
-        r_mult=(net/planned) if planned>0 else None; score=float(m.get('score') or 0)
+        r_mult=(net/planned) if planned>0 else None
+        score=float(m.get('score') or 0) if m else 0
         right=[]; wrong=[]
         if net>0: right.append('Сделка закрылась в плюс после учёта комиссии.')
         elif net<0: wrong.append('Сделка закрылась в минус после учёта комиссии.')
         if m:
             if score>=80 and net<=0: wrong.append(f'Высокий входной score {score:g} не подтвердился результатом.')
             if score<70 and net>0: right.append(f'Движение подтвердилось несмотря на score {score:g}.')
-            strategy=str(m.get('strategy') or 'UNKNOWN')
-            symbol=str(m.get('symbol') or r.get('symbol') or '?')
-            side=str(m.get('side') or r.get('side') or '?')
+        symbol=str((m or {}).get('symbol') or r.get('symbol') or '?')
+        side=str((m or {}).get('side') or r.get('side') or '?')
+        strategy=str((m or {}).get('strategy') or 'UNKNOWN')
+        if m:
             lesson=f"{outcome}: {symbol} {side}, {strategy}, net P&L {net:+.4f} USDT"
         else:
-            symbol=str(r.get('symbol') or '?'); side=str(r.get('side') or '?')
-            strategy='UNKNOWN'
-            wrong.append('Контекст входа не найден; сохранён результат Bybit для последующего обучения.')
-            lesson=f"{outcome}: {symbol} {side}, контекст входа не найден, net P&L {net:+.4f} USDT."
+            wrong.append('Контекст входа не найден; результат Bybit всё равно сохранён для обучения.')
+            lesson=f"{outcome}: {symbol} {side}, контекст входа не найден, net P&L {net:+.4f} USDT"
         if r_mult is not None: lesson+=f", результат {r_mult:+.2f}R"
         lesson+=f". Контекст: regime={(m.get('market_regime') if m else None) or 'UNKNOWN'}, timing={(m.get('entry_timing') if m else None) or 'UNKNOWN'}, news={(m.get('news_impact') if m else None) or 'UNKNOWN'}."
-        row=(key,str(m.get('mode') or r.get('mode') or ''),str(m.get('symbol') or r.get('symbol') or ''),str(m.get('side') or r.get('side') or ''),str(m.get('strategy') or ''),outcome,net,r_mult,score,planned,lesson,' '.join(right),' '.join(wrong),time.time())
+        row=(key,str((m or {}).get('mode') or r.get('mode') or ''),symbol,side,str((m or {}).get('strategy') or 'UNKNOWN'),outcome,net,r_mult,score,planned,lesson,' '.join(right),' '.join(wrong),time.time())
         with _lock, _conn() as c:
             cur=c.cursor()
             if str(c.__class__.__module__).startswith('psycopg'):
                 cur.execute("""INSERT INTO learning_lessons
                     (external_id,mode,symbol,side,strategy,outcome,net_pnl,r_multiple,score,planned_risk,lesson,what_went_right,what_went_wrong,created_at)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (external_id) DO UPDATE SET outcome=EXCLUDED.outcome,net_pnl=EXCLUDED.net_pnl,r_multiple=EXCLUDED.r_multiple,lesson=EXCLUDED.lesson,what_went_right=EXCLUDED.what_went_right,what_went_wrong=EXCLUDED.what_went_wrong""", row)
+                    ON CONFLICT (external_id) DO UPDATE SET mode=EXCLUDED.mode,symbol=EXCLUDED.symbol,side=EXCLUDED.side,strategy=EXCLUDED.strategy,outcome=EXCLUDED.outcome,net_pnl=EXCLUDED.net_pnl,r_multiple=EXCLUDED.r_multiple,score=EXCLUDED.score,planned_risk=EXCLUDED.planned_risk,lesson=EXCLUDED.lesson,what_went_right=EXCLUDED.what_went_right,what_went_wrong=EXCLUDED.what_went_wrong""", row)
             else:
                 cur.execute("""INSERT INTO learning_lessons
                     (external_id,mode,symbol,side,strategy,outcome,net_pnl,r_multiple,score,planned_risk,lesson,what_went_right,what_went_wrong,created_at)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(external_id) DO UPDATE SET outcome=excluded.outcome,net_pnl=excluded.net_pnl,r_multiple=excluded.r_multiple,lesson=excluded.lesson,what_went_right=excluded.what_went_right,what_went_wrong=excluded.what_went_wrong""", row)
-        lessons.append({'external_id':key,'outcome':outcome,'net_pnl':net,'r_multiple':r_mult,'lesson':lesson,'what_went_right':' '.join(right),'what_went_wrong':' '.join(wrong)})
-    return {'created_or_updated':len(lessons),'lessons':lessons}
+                    ON CONFLICT(external_id) DO UPDATE SET mode=excluded.mode,symbol=excluded.symbol,side=excluded.side,strategy=excluded.strategy,outcome=excluded.outcome,net_pnl=excluded.net_pnl,r_multiple=excluded.r_multiple,score=excluded.score,planned_risk=excluded.planned_risk,lesson=excluded.lesson,what_went_right=excluded.what_went_right,what_went_wrong=excluded.what_went_wrong""", row)
+        lessons.append({'external_id':key,'outcome':outcome,'net_pnl':net,'r_multiple':r_mult,'lesson':lesson,'what_went_right':' '.join(right),'what_went_wrong':' '.join(wrong),'context_found':bool(m),'match_method':match_method})
+    return {'created_or_updated':len(lessons),'closed_rows':len(rows),'matched_context':matched,'unmatched_context':unmatched,'match_methods':match_methods,'lessons':lessons}
 
 
 def recent_lessons(limit=50):
@@ -215,6 +243,7 @@ def build_learning_report(limit=1000):
         'learning_enabled': True,
         'auto_apply': False,
         'trades_analyzed': len(rows),
+        'closed_trades': len(rows),
         'overall': _stats(rows),
         'by_mode': _group(rows,'mode'),
         'by_symbol': _group(rows,'symbol'),
@@ -222,7 +251,7 @@ def build_learning_report(limit=1000):
         'minimum_samples_for_insight': 20,
         'insights': [],
         'recent_lessons': recent_lessons(50),
-        'lesson_sync': {'created_or_updated': lesson_sync.get('created_or_updated', 0)},
+        'lesson_sync': {k: lesson_sync.get(k, 0) for k in ('created_or_updated','closed_rows','matched_context','unmatched_context','match_methods')},
         'generated_at': int(time.time()*1000),
     }
     # Contextual grouping is only possible when entry metadata exists.
@@ -233,14 +262,15 @@ def build_learning_report(limit=1000):
     enriched=[]
     order_ids=[r.get('external_id') for r in rows]
     aliases=aliases_for_orders(order_ids)
+    _, by_symbol_side = _load_meta_indexes()
+    matched_context=0
     for r in rows:
-        key=str(r['external_id'])
-        m=meta.get(key)
-        if not m:
-            link=aliases.get(key)
-            if link:
-                m=meta.get(str(link))
-        if m: enriched.append({**r, **m, 'matched_via_alias': key not in meta})
+        m, method = _match_meta(r, meta, by_symbol_side, aliases)
+        if m:
+            matched_context += 1
+            enriched.append({**r, **m, 'matched_via': method})
+    report['contextual_trades']=matched_context
+    report['trades_without_entry_context']=max(0, len(rows)-matched_context)
     for key in ('strategy','side','market_regime','entry_timing','news_impact'):
         groups={}
         for r in enriched: groups.setdefault(r.get(key) or 'UNKNOWN',[]).append(r)

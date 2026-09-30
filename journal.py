@@ -179,14 +179,18 @@ def aliases_for_orders(order_ids):
     if not ids: return {}
     init_db()
     with _lock, _conn() as c:
-        cur=c.cursor()
+        cur=c.cursor(); out={}
         if _is_pg():
             placeholders=','.join(['%s']*len(ids))
-            cur.execute(f'SELECT order_id,order_link_id FROM trade_id_aliases WHERE order_id IN ({placeholders})', tuple(ids))
+            cur.execute(f'SELECT order_id,order_link_id FROM trade_id_aliases WHERE order_id IN ({placeholders}) OR order_link_id IN ({placeholders})', tuple(ids)+tuple(ids))
         else:
             placeholders=','.join(['?']*len(ids))
-            cur.execute(f'SELECT order_id,order_link_id FROM trade_id_aliases WHERE order_id IN ({placeholders})', tuple(ids))
-        return {str(r[0]):str(r[1]) for r in cur.fetchall()}
+            cur.execute(f'SELECT order_id,order_link_id FROM trade_id_aliases WHERE order_id IN ({placeholders}) OR order_link_id IN ({placeholders})', tuple(ids)+tuple(ids))
+        for oid, link in cur.fetchall():
+            oid=str(oid); link=str(link)
+            out[oid]=link
+            out[link]=oid
+        return out
 
 
 def recent(limit=100):

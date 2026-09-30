@@ -53,7 +53,7 @@ async def _history_sync_loop():
     while True:
         try:
             if MODE in ("demo", "live"):
-                result = sync_closed_pnl_detailed(MODE, __import__("engine")._demo_closed_pnl(100))
+                result = sync_closed_pnl_detailed(MODE, __import__("engine")._demo_closed_pnl(500))
                 # Record the exchange->DB result before learning. Learning must never
                 # make a successful history sync look like a failed database sync.
                 _history_sync_state.update({
@@ -81,7 +81,7 @@ async def lifespan(_app):
     _apply_trading_settings()
     if MODE in ('demo','live'):
         try:
-            result = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
+            result = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(500))
             _history_sync_state.update({"last_run": time.time(), "last_ok": not bool(result.get("errors")), "synced": int(result.get("synced", 0)), "exchange_closed_count": int(result.get("exchange_closed_count", 0)), "errors": list(result.get("errors", [])), "learning_errors": []})
             try:
                 record_lessons_from_closed(1000)
@@ -114,7 +114,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.20', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.22', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -200,7 +200,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.20', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.22', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -432,7 +432,7 @@ def database_status():
 def learning():
     try:
         if MODE in ('demo','live'):
-            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(100))
+            sync_closed_pnl(MODE, __import__('engine')._demo_closed_pnl(500))
         report=build_learning_report(1000)
         report['durable_journal']=bool(db_status().get('durable'))
         if not report['durable_journal']:
@@ -445,7 +445,7 @@ def learning():
 def learning_lessons():
     try:
         if MODE in ('demo','live'):
-            sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
+            sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(500))
             record_lessons_from_closed(1000)
         return {'ok': True, 'durable_journal': bool(db_status().get('durable')), 'lessons': recent_lessons(100)}
     except Exception as e:
@@ -474,16 +474,22 @@ def journal():
     try:
         sync = {'synced': 0, 'exchange_closed_count': 0, 'errors': []}
         if MODE in ('demo','live'):
-            sync = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(100))
+            sync = sync_closed_pnl_detailed(MODE, __import__('engine')._demo_closed_pnl(500))
         db = db_status()
-        trades = journal_recent(100)
+        trades = journal_recent(500)
+        try:
+            from learning_engine import record_lessons_from_closed
+            learning_sync = record_lessons_from_closed(500)
+        except Exception as e:
+            learning_sync = {'closed_rows': len(trades), 'created_or_updated': 0, 'matched_context': 0, 'unmatched_context': len(trades), 'errors': [str(e)]}
         return {
             'ok': True, 'mode': MODE, 'durable_journal': bool(db.get('durable')),
             'db_backend': db.get('backend'), 'db_error': db.get('error'),
             'exchange_closed_count': sync.get('exchange_closed_count', 0),
             'history_sync': _history_sync_state,
             'synced_count': sync.get('synced', 0), 'sync_errors': sync.get('errors', []),
-            'db_trade_count': len(trades), 'trades': trades
+            'db_trade_count': len(trades), 'trades': trades,
+            'learning_sync': learning_sync
         }
     except Exception as e:
         return {'ok': False, 'mode': MODE, 'trades': [], 'error': str(e)}
