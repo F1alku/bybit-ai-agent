@@ -15,6 +15,7 @@ from engine import market_snapshot, scan_market, paper_state, paper_open, paper_
 from journal import init_db, recent as journal_recent, sync_closed_pnl, sync_closed_pnl_detailed, get_setting, set_setting, db_status
 from learning_engine import build_learning_report, init_learning_db, record_lessons_from_closed, recent_lessons
 from news_engine import snapshot as news_snapshot
+from liquidity_engine import status as liquidity_status
 from trader import run_auto_cycle
 
 AUTO_INTERVAL_SEC = int(get_setting('auto_interval_sec', os.getenv('AUTO_INTERVAL_SEC', '60')))
@@ -104,7 +105,7 @@ async def lifespan(_app):
             except asyncio.CancelledError:
                 pass
 
-app = FastAPI(title='Bybit AI Agent Web', version='6.1.16', lifespan=lifespan)
+app = FastAPI(title='Bybit AI Agent Web', version='6.1.18', lifespan=lifespan)
 app.mount('/static', StaticFiles(directory='static'), name='static')
 
 @app.middleware('http')
@@ -190,7 +191,7 @@ def index(): return FileResponse('static/index.html')
 @app.get('/api/health')
 def health():
     import engine
-    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.8', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
+    return {'ok': True, 'service': 'bybit-ai-agent-web', 'version': '6.1.19', 'mode': engine.MODE, 'live_armed': bool(getattr(engine, 'LIVE_TRADING_ARMED', False)), 'auto_scanner': auto_state['enabled'], 'strategy': strategy_state['mode']}
 
 @app.get('/api/strategy')
 def strategy_status():
@@ -234,6 +235,10 @@ def auto_toggle():
         set_setting('auto_enabled', '1' if auto_state['enabled'] else '0')
         auto_state['last_action'] = 'enabled by user' if auto_state['enabled'] else 'disabled by user'
     return auto_status()
+
+@app.get('/api/liquidity/status')
+def liquidity_status_api():
+    return {'ok': True, **liquidity_status()}
 
 @app.get('/api/news')
 def news():

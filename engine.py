@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 from news_engine import snapshot as news_snapshot, apply_to_signal as apply_news_to_signal
+from liquidity_engine import analyze as liquidity_analyze
 
 MODE = os.getenv('BYBIT_MODE', 'paper').lower()
 if MODE not in ('paper', 'demo', 'live'):
@@ -738,6 +739,7 @@ def scan_market(interval='15', limit_symbols=0, entry_threshold=ENTRY_SCORE_MIN,
     except Exception as e:
         failures.append({'stage':'news','error':str(e)})
         news = {'status':'error','impact':'unknown','items':[],'btc_reaction':{'strength':'unknown','pct_15m':0,'pct_30m':0}}
+    results.sort(key=lambda x:x.get('score',x.get('hint',0)), reverse=True)
     return _json_safe({'ok':True,'mode':MODE,'setup_interval':interval,
             'universe_size':len(universe),'checked':len(top),'technical_checked':len(preliminary),'technical_target':len(top),'technical_skipped':max(0,len(top)-len(preliminary)),
             'deep_checked':len(deep),'deep_target':len(deep),'micro_checked':len(micro_map),'micro_target':len(micro_targets),
@@ -1100,6 +1102,12 @@ def _demo_risk_qty(symbol, entry, sl, requested_leverage=None, risk_pct=None, re
     if margin > budget * MAX_MARGIN_FRACTION:
         qty = _round_step((budget * MAX_MARGIN_FRACTION * leverage) / entry, qty_step) if qty_step else (budget * MAX_MARGIN_FRACTION * leverage) / entry
         margin = entry * qty / leverage
+    # Market orders have their own exchange maximum. Re-apply it after every
+    # margin/min-notional adjustment so later calculations can never increase qty
+    # above the final Market-order ceiling.
+    if max_qty > 0:
+        qty = min(qty, max_qty)
+        qty = _round_step(qty, qty_step) if qty_step else qty
     actual_risk = qty * dist
     if actual_risk > risk_cash * 1.000001:
         raise ValueError(f'position risk ${actual_risk:.2f} exceeds allowed ${risk_cash:.2f}')
@@ -1277,7 +1285,22 @@ def _legacy_position_exit_analysis(p):
 
 
 def _position_exit_analysis(p):
+    # Liquidity Intelligence is ONLY for already-open positions.
+    # It never gates entries and never increases position size.
     base=_legacy_position_exit_analysis(p)
+    try:
+        from liquidity_engine import analyze as liquidity_analyze
+        symbol=str(p.get('symbol') or '').upper()
+        mark=float(p.get('markPrice') or p.get('avgPrice') or 0)
+        liq=liquidity_analyze(symbol, mark)
+        base['liquidity']=liq
+        side='LONG' if p.get('side')=='Buy' else 'SHORT'
+        adverse=(side=='LONG' and liq.get('sweep_direction')=='DOWN') or (side=='SHORT' and liq.get('sweep_direction')=='UP')
+        base['liquidity_risk']='HIGH' if adverse and liq.get('sweep_risk')=='HIGH' else liq.get('sweep_risk','LOW')
+        base['liquidity_action']='WATCH' if adverse else ('HOLD' if liq.get('decision') in ('CONTEXT','NEUTRAL') else 'WATCH')
+    except Exception as e:
+        base['liquidity']={'enabled':False,'source':'unavailable','error':str(e)[:180]}
+        base['liquidity_risk']='UNKNOWN'; base['liquidity_action']='WATCH'
     try:
         from thesis_engine import analyze_position
         t=analyze_position(p)
@@ -1553,7 +1576,7 @@ def _symbol_rules(symbol):
     for x in source:
         if x.get('symbol') == symbol:
             lot = x.get('lotSizeFilter') or {}
-            return float(lot.get('qtyStep') or 0), float(lot.get('minOrderQty') or 0), float(lot.get('maxOrderQty') or 0)
+            return float(lot.get('qtyStep') or 0), float(lot.get('minOrderQty') or 0), float(lot.get('maxMktOrderQty') or lot.get('maxOrderQty') or 0)
     return 0.0, 0.0, 0.0
 
 def _symbol_constraints(symbol):
